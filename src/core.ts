@@ -529,11 +529,13 @@ export function createStreamCommandCode(deps: CoreDependencies) {
           // event, which arrives after "finish". The local catalog estimate in
           // "finish" is only off-peak and can drift from the actual bill, so
           // when real cost figures are present we overwrite usage.cost with
-          // them. The API gives input/output inference cost totals but no
-          // cache split, so the input-side real cost is apportioned across
-          // fresh input and cache reads by token share.
+          // them. The API reports the combined input inference cost but no
+          // fresh/cache split, so the fresh-input rate is derived from the
+          // real input cost minus cache reads billed at the model's catalog
+          // cacheRead rate (cache pricing does not vary by peak window). That
+          // derived rate is then applied to the fresh tokens; peak pricing
+          // (2x input/output) is captured automatically.
           case "provider-metadata": {
-
             const meta = isRecord(event.providerMetadata)
               ? isRecord(event.providerMetadata.gateway)
                 ? event.providerMetadata.gateway
@@ -544,23 +546,37 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             if (meta && inputCost !== undefined && outputCost !== undefined) {
               const realInput = Math.max(0, inputCost)
               const realOutput = Math.max(0, outputCost)
-              const realTotal = realInput + realOutput
-              // Apportion the real input cost across fresh input and cache reads
-              // by token share so per-part figures stay meaningful. Zero-token
-              // requests are attributed to fresh input.
-              const freshTokens = output.usage.input
-              const cacheTokens = output.usage.cacheRead + output.usage.cacheWrite
-              const inputTokensTotal = freshTokens + cacheTokens
-              if (inputTokensTotal > 0) {
-                output.usage.cost.input = (realInput * freshTokens) / inputTokensTotal
-                output.usage.cost.cacheRead = (realInput * cacheTokens) / inputTokensTotal
-              } else {
-                output.usage.cost.input = realInput
-                output.usage.cost.cacheRead = 0
-              }
               output.usage.cost.output = realOutput
               output.usage.cost.cacheWrite = 0
-              output.usage.cost.total = realTotal
+              output.usage.cost.total = realInput + realOutput
+
+              const freshTokens = output.usage.input
+              const cacheTokens = output.usage.cacheRead + output.usage.cacheWrite
+              const cacheRatePerToken = (model.cost?.cacheRead ?? 0) / 1_000_000
+              const cacheCost = cacheTokens * cacheRatePerToken
+              if (freshTokens > 0 && realInput >= cacheCost) {
+                // Derive the effective fresh-input rate (captures peak 2x
+                // automatically) and bill fresh tokens at it.
+                const freshRate = (realInput - cacheCost) / freshTokens
+                output.usage.cost.input = freshTokens * freshRate
+                output.usage.cost.cacheRead = cacheCost
+              } else if (freshTokens > 0) {
+                // Cache reads alone would exceed the reported input cost;
+                // fall back to token-share apportionment.
+                const share = freshTokens / (freshTokens + cacheTokens)
+                output.usage.cost.input = realInput * share
+                output.usage.cost.cacheRead = realInput * (1 - share)
+              } else {
+                output.usage.cost.input = 0
+                output.usage.cost.cacheRead = realInput
+              }
+              // Guard against rounding drift so parts always sum to the real total.
+              const parts = output.usage.cost.input + output.usage.cost.cacheRead
+              if (parts !== realInput && parts > 0) {
+                const scale = realInput / parts
+                output.usage.cost.input *= scale
+                output.usage.cost.cacheRead *= scale
+              }
             }
             break
           }
