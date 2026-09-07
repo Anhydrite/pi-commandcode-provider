@@ -175,6 +175,73 @@ describe("streamCommandCode — successful streams", () => {
     assert.equal(calculatedUsages.length, 1)
   })
 
+  it("overwrites usage.cost with the real billed cost from provider-metadata", async () => {
+    // Simulate the real Command Code stream: finish reports token usage, then
+    // the trailing provider-metadata event reports the actual billed cost
+    // (which includes peak pricing and gateway rates). Peak input rate for
+    // deepseek-v4-flash is 2x the off-peak catalog rate used by the local
+    // estimate, so the real total must win.
+    server.mockResponse({
+      type: "success",
+      // finish and provider-metadata arrive in the same network chunk in the
+      // real stream, so group them here to mirror that behavior.
+      chunks: [
+        `${JSON.stringify({ type: "text-delta", text: "Hi" })}\n`,
+        `${JSON.stringify({
+          type: "finish",
+          finishReason: "stop",
+          totalUsage: {
+            inputTokens: 7642,
+            outputTokens: 30,
+            inputTokenDetails: { noCacheTokens: 90, cacheReadTokens: 7552 },
+          },
+        })}\n${JSON.stringify({
+          type: "provider-metadata",
+          providerMetadata: {
+            deepseek: {},
+            gateway: {
+              cost: "0.000092464",
+              inferenceCost: "0.000092464",
+              inputInferenceCost: "0.000072664",
+              outputInferenceCost: "0.0000198",
+              generationId: "gen_test",
+            },
+          },
+        })}\n`,
+      ],
+    })
+    const { streamCommandCode } = createTestDeps({ apiBase: server.baseUrl() })
+
+    const events = await collectEvents(
+      streamCommandCode(makeModel(), makeContext(), { apiKey: "mock-key" }),
+    )
+    const done = events.at(-1)
+    assert.equal(done?.type, "done")
+    if (done?.type !== "done") throw new Error("expected done")
+
+    // Real total from provider-metadata (input 0.000072664 + output 0.0000198)
+    assert.ok(Math.abs(done.message.usage.cost.total - 0.000092464) < 1e-12)
+    assert.ok(Math.abs(done.message.usage.cost.output - 0.0000198) < 1e-12)
+    // Input cost apportioned by token share across fresh input and cache reads:
+    // fresh = 90/7642, cache = 7552/7642 of the real input cost.
+    const realInput = 0.000072664
+    const freshShare = 90 / 7642
+    assert.ok(
+      Math.abs(done.message.usage.cost.input - realInput * freshShare) < 1e-12,
+    )
+    assert.ok(
+      Math.abs(
+        done.message.usage.cost.cacheRead -
+          realInput * (7552 / 7642),
+      ) < 1e-12,
+    )
+    // Token accounting must be untouched by the real-cost overwrite.
+    assert.equal(done.message.usage.input, 90)
+    assert.equal(done.message.usage.cacheRead, 7552)
+    assert.equal(done.message.usage.totalTokens, 7672)
+  })
+
+
   it("sends images for vision-capable models", async () => {
     server.mockResponse({
       type: "success",

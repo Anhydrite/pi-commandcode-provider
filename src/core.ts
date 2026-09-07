@@ -97,6 +97,19 @@ function defaultUsage(): Usage {
   }
 }
 
+/**
+ * Parse a finite number from either a number or a numeric string. The Command
+ * Code gateway reports monetary costs as decimal strings ("0.000092464").
+ */
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value)
+    return Number.isFinite(n) ? n : undefined
+  }
+  return undefined
+}
+
 function commandCodeUsage(event: Record<string, unknown>): Record<string, unknown> | undefined {
   return isRecord(event.totalUsage) ? event.totalUsage : undefined
 }
@@ -511,6 +524,47 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             break
           }
 
+          // Command Code reports the REAL billed cost (including peak pricing
+          // and model-specific gateway rates) in the final provider-metadata
+          // event, which arrives after "finish". The local catalog estimate in
+          // "finish" is only off-peak and can drift from the actual bill, so
+          // when real cost figures are present we overwrite usage.cost with
+          // them. The API gives input/output inference cost totals but no
+          // cache split, so the input-side real cost is apportioned across
+          // fresh input and cache reads by token share.
+          case "provider-metadata": {
+
+            const meta = isRecord(event.providerMetadata)
+              ? isRecord(event.providerMetadata.gateway)
+                ? event.providerMetadata.gateway
+                : undefined
+              : undefined
+            const inputCost = toFiniteNumber(meta?.inputInferenceCost)
+            const outputCost = toFiniteNumber(meta?.outputInferenceCost)
+            if (meta && inputCost !== undefined && outputCost !== undefined) {
+              const realInput = Math.max(0, inputCost)
+              const realOutput = Math.max(0, outputCost)
+              const realTotal = realInput + realOutput
+              // Apportion the real input cost across fresh input and cache reads
+              // by token share so per-part figures stay meaningful. Zero-token
+              // requests are attributed to fresh input.
+              const freshTokens = output.usage.input
+              const cacheTokens = output.usage.cacheRead + output.usage.cacheWrite
+              const inputTokensTotal = freshTokens + cacheTokens
+              if (inputTokensTotal > 0) {
+                output.usage.cost.input = (realInput * freshTokens) / inputTokensTotal
+                output.usage.cost.cacheRead = (realInput * cacheTokens) / inputTokensTotal
+              } else {
+                output.usage.cost.input = realInput
+                output.usage.cost.cacheRead = 0
+              }
+              output.usage.cost.output = realOutput
+              output.usage.cost.cacheWrite = 0
+              output.usage.cost.total = realTotal
+            }
+            break
+          }
+
           case "abort": {
             throw abortError("Request aborted")
           }
@@ -722,10 +776,23 @@ export function createStreamCommandCode(deps: CoreDependencies) {
                 const lines = buffer.split("\n")
                 buffer = lines.pop() ?? ""
 
-                for (const line of lines) {
+                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
                   if (controller.signal.aborted) throw abortError("Aborted")
+                  const line = lines[lineIdx]
                   handleEvent(parseStreamEventLine(line))
-                  if (finished) break readLoop
+                  // finish marks the logical end of the assistant turn, but the
+                  // provider-metadata event carrying the REAL billed cost is
+                  // emitted right after "finish" (often in the same network
+                  // chunk). Keep processing the remaining lines of this chunk
+                  // so that metadata is handled, then stop reading further
+                  // chunks (preserves early-cancel behavior on hanging servers).
+                  if (finished) {
+                    for (let restIdx = lineIdx + 1; restIdx < lines.length; restIdx++) {
+                      if (controller.signal.aborted) throw abortError("Aborted")
+                      handleEvent(parseStreamEventLine(lines[restIdx]))
+                    }
+                    break readLoop
+                  }
                 }
               }
             } catch (streamError: unknown) {
