@@ -394,3 +394,44 @@ describe("Command Code transport router — real-cost mode (preferGenerate)", ()
     assert.equal(providerCalls, 0, "no fallback after content was already delivered")
   })
 })
+
+describe("Command Code transport router — dynamic preferGenerate function", () => {
+  it("evaluates the flag per request so it can be toggled at runtime", async () => {
+    let providerCalls = 0
+    let generateCalls = 0
+    let realCost = false
+    const router = createCommandCodeTransportRouter({
+      createStream: createTestEventStream,
+      streamProvider: (_model, _context, options) => {
+        providerCalls += 1
+        return providerStream(new Response("ok", { status: 200 }), "provider", options)
+      },
+      streamGenerate: () => {
+        generateCalls += 1
+        return completedStream("generate")
+      },
+      preferGenerate: () => realCost,
+    })
+    const options: StreamOptions = {
+      apiKey: "k",
+      fetch: () => Promise.resolve(new Response("ok", { status: 200 })),
+    }
+
+    // OFF → provider first.
+    await collectEvents(router.stream(makeModel(), makeContext(), options))
+    assert.equal(providerCalls, 1)
+    assert.equal(generateCalls, 0)
+
+    // Flipped at runtime → next request goes through generate.
+    realCost = true
+    await collectEvents(router.stream(makeModel(), makeContext(), options))
+    assert.equal(providerCalls, 1)
+    assert.equal(generateCalls, 1)
+
+    // Flipped back → provider again.
+    realCost = false
+    await collectEvents(router.stream(makeModel(), makeContext(), options))
+    assert.equal(providerCalls, 2)
+    assert.equal(generateCalls, 1)
+  })
+})

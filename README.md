@@ -151,13 +151,15 @@ Models missing from that table display zero cost in pi. This does **not** mean t
 
 ## Real request cost (opt-in)
 
-The estimated costs above come from a static local table, and the Provider API does not return billing figures. If you want pi to record the **real billed cost** for every request — peak/off-peak windows, gateway and model-specific rates included, with nothing estimated or hard-coded — set:
+The estimated costs above come from a static local table, and the Provider API does not return billing figures. If you want pi to record the **real billed cost** for every request — peak/off-peak windows, gateway and model-specific rates included, with nothing estimated or hard-coded — toggle it inside pi:
 
-```sh
-export COMMANDCODE_REAL_COST=1
+```
+/commandcode-realcost        (toggle on/off, or: /commandcode-realcost on|off)
 ```
 
-With this flag every request is routed through the `/alpha/generate` transport, whose `provider-metadata` event reports the exact `inputInferenceCost` / `outputInferenceCost` / `cost` billed for that request. It applies to **any model** (switch models freely to compare real costs). The Provider API remains the default when the flag is unset.
+The choice is persisted in `~/.pi/agent/settings.json` (`commandcodeRealCost`) and applies to the next request — no restart needed. For headless runs you can also set `COMMANDCODE_REAL_COST=1` as the initial default when no setting is saved yet.
+
+With the mode on, every request is routed through the `/alpha/generate` transport, whose `provider-metadata` event reports the exact `inputInferenceCost` / `outputInferenceCost` / `cost` billed for that request. It applies to **any model** (switch models freely to compare real costs). The Provider API remains the default when the mode is off.
 
 The generate protocol is text-only: a request that generate rejects before streaming any content (for example image input to a vision model) automatically falls back to the Provider API for that request, so nothing breaks — that request simply keeps the estimated cost. Requests that fail mid-stream after content was already delivered are surfaced as errors and never replayed through the other transport.
 

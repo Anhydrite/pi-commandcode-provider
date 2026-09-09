@@ -22,15 +22,17 @@ interface TransportDependencies {
     options?: StreamOptions,
   ) => AssistantMessageEventStreamLike
   /**
-   * When true, route every request through the /alpha/generate transport first
-   * so the real billed cost returned in its provider-metadata event is captured
-   * for ANY model (peak/off-peak, gateway and model-specific rates included —
-   * nothing is estimated or hard-coded). Generate is text-only, so a request
-   * that fails before producing any content (for example image input) falls
-   * back to the Provider API for that request. Defaults to false, which keeps
-   * the Provider API as the preferred transport.
+   * When true (or a function returning true), route every request through the
+   * /alpha/generate transport first so the real billed cost returned in its
+   * provider-metadata event is captured for ANY model (peak/off-peak, gateway
+   * and model-specific rates included — nothing is estimated or hard-coded).
+   * Generate is text-only, so a request that fails before producing any
+   * content (for example image input) falls back to the Provider API for that
+   * request. Defaults to false, which keeps the Provider API as the preferred
+   * transport. A function is evaluated per request so the mode can be toggled
+   * at runtime (e.g. via /commandcode-realcost).
    */
-  preferGenerate?: boolean
+  preferGenerate?: boolean | (() => boolean)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -79,7 +81,14 @@ function errorEvent(model: ModelLike, error: unknown): AssistantMessageEvent {
 export function createCommandCodeTransportRouter(deps: TransportDependencies) {
   let transport: CommandCodeTransport = "unknown"
   let apiKey: string | undefined
-  const preferGenerate = deps.preferGenerate === true
+  // Tracks the last preferGenerate value so a runtime toggle (which changes the
+  // meaning of the transport memo) resets it like a credential change does.
+  let lastPreferGenerate: boolean | undefined
+
+  function preferGenerateNow(): boolean {
+    const value = deps.preferGenerate
+    return typeof value === "function" ? value() : value === true
+  }
 
   function pipe(
     source: AssistantMessageEventStreamLike,
@@ -98,6 +107,7 @@ export function createCommandCodeTransportRouter(deps: TransportDependencies) {
     reset(): void {
       transport = "unknown"
       apiKey = undefined
+      lastPreferGenerate = undefined
     },
 
     stream(
@@ -105,8 +115,10 @@ export function createCommandCodeTransportRouter(deps: TransportDependencies) {
       context: ContextLike,
       options?: StreamOptions,
     ): AssistantMessageEventStreamLike {
-      if (options?.apiKey !== apiKey) {
+      const preferGenerate = preferGenerateNow()
+      if (options?.apiKey !== apiKey || preferGenerate !== lastPreferGenerate) {
         apiKey = options?.apiKey
+        lastPreferGenerate = preferGenerate
         transport = "unknown"
       }
       const requestApiKey = options?.apiKey

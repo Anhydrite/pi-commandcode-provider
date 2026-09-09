@@ -37,6 +37,7 @@ import { getApiKey as getOAuthApiKey, login, refreshToken } from "./src/oauth.ts
 import { normalizeCommandCodeMessage } from "./src/overflow.ts"
 import { MODEL_COSTS, ZERO_MODEL_COST } from "./src/pricing.ts"
 import { registerCommandCodeQuota } from "./src/quota-command.ts"
+import { loadRealCostEnabled, saveRealCostEnabled } from "./src/real-cost.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
 
@@ -161,8 +162,9 @@ export default async function (pi: ExtensionAPI) {
   // Opt into routing every request through /alpha/generate so the real billed
   // cost (peak/off-peak, gateway and model-specific rates) is returned by the
   // API in provider-metadata for ANY model. Without it the Provider API is
-  // preferred and costs stay a local estimate.
-  const preferGenerate = process.env.COMMANDCODE_REAL_COST === "1"
+  // preferred and costs stay a local estimate. Toggle with /commandcode-realcost
+  // (persisted) or set COMMANDCODE_REAL_COST=1 as the initial default.
+  const realCost = { enabled: await loadRealCostEnabled() }
   const streamGenerate = createStreamCommandCode({
     createStream: () => new AssistantMessageEventStream(),
     calculateCost: calculateCommandCodeCost,
@@ -180,7 +182,29 @@ export default async function (pi: ExtensionAPI) {
       ),
     streamGenerate: (model, context, options) =>
       streamGenerate(model, context, resolveStreamOptions(options)),
-    preferGenerate,
+    preferGenerate: () => realCost.enabled,
+  })
+
+  pi.registerCommand("commandcode-realcost", {
+    description: "Toggle real billed request cost (route all models through /alpha/generate)",
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase()
+      const next =
+        arg === "on" || arg === "1" || arg === "true"
+          ? true
+          : arg === "off" || arg === "0" || arg === "false"
+            ? false
+            : !realCost.enabled
+      realCost.enabled = next
+      await saveRealCostEnabled(next)
+      await ctx.waitForIdle?.()
+      ctx.ui.notify(
+        next
+          ? "Real request cost ON: every request now routes through /alpha/generate and records its real billed cost (peak/off-peak included)."
+          : "Real request cost OFF: Provider API preferred, costs are local estimates.",
+        "info",
+      )
+    },
   })
 
   // pi dispatches the main chat through the registered provider, but sibling

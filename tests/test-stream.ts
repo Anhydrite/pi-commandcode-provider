@@ -289,7 +289,8 @@ describe("streamCommandCode — successful streams", () => {
     assert.ok(Math.abs(done.message.usage.cost.total - (inputCost + outputCost)) < 1e-15)
     // The derived fresh and cache rates must be 2x the catalog rates.
     const derivedFreshRate = (done.message.usage.cost.input / done.message.usage.input) * 1e6
-    const derivedCacheRate = (done.message.usage.cost.cacheRead / done.message.usage.cacheRead) * 1e6
+    const derivedCacheRate =
+      (done.message.usage.cost.cacheRead / done.message.usage.cacheRead) * 1e6
     assert.ok(Math.abs(derivedFreshRate - 0.44) < 1e-9)
     assert.ok(Math.abs(derivedCacheRate - 0.014) < 1e-9)
   })
