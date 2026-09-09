@@ -158,6 +158,11 @@ export default async function (pi: ExtensionAPI) {
   const modelsTimeoutMs = getModelsTimeoutMs()
   const modelsCachePath =
     process.env.COMMANDCODE_MODELS_CACHE ?? join(getAgentDir(), "commandcode-models.json")
+  // Opt into routing every request through /alpha/generate so the real billed
+  // cost (peak/off-peak, gateway and model-specific rates) is returned by the
+  // API in provider-metadata for ANY model. Without it the Provider API is
+  // preferred and costs stay a local estimate.
+  const preferGenerate = process.env.COMMANDCODE_REAL_COST === "1"
   const streamGenerate = createStreamCommandCode({
     createStream: () => new AssistantMessageEventStream(),
     calculateCost: calculateCommandCodeCost,
@@ -175,6 +180,7 @@ export default async function (pi: ExtensionAPI) {
       ),
     streamGenerate: (model, context, options) =>
       streamGenerate(model, context, resolveStreamOptions(options)),
+    preferGenerate,
   })
 
   // pi dispatches the main chat through the registered provider, but sibling

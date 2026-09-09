@@ -4,6 +4,7 @@
 
 - Fix the real billed cost (peak/off-peak aware) reported by `provider-metadata` being silently dropped whenever the event arrived in a later network chunk than `finish`: the generate-transport reader now keeps reading for a short grace period after `finish` instead of stopping at the chunk boundary, so `usage.cost` reflects the gateway bill (2x during peak hours) rather than the off-peak catalog estimate.
 - Attribute the real input inference cost across fresh and cache-read tokens with the window multiplier derived from the real output cost (the gateway bills cache reads at the peak rate too), keeping the derived per-token rates aligned with the actual bill.
+- Add an opt-in `COMMANDCODE_REAL_COST=1` mode that routes every request through `/alpha/generate` so the real billed cost returned in `provider-metadata` is recorded for any model, instead of the Provider API's local cost estimate. Generate failures before any content (image input, permission errors) automatically fall back to the Provider API for that request; mid-stream failures are never replayed.
 
 ## 0.6.4 - 2026-09-03
 

@@ -149,6 +149,18 @@ The Command Code Provider API does not currently include prices in its model cat
 
 Models missing from that table display zero cost in pi. This does **not** mean that Command Code will bill the request at zero. The Command Code Usage page remains authoritative for each request. Check the current [Command Code pricing](https://commandcode.ai/docs/resources/pricing-limits) before relying on the displayed value.
 
+## Real request cost (opt-in)
+
+The estimated costs above come from a static local table, and the Provider API does not return billing figures. If you want pi to record the **real billed cost** for every request — peak/off-peak windows, gateway and model-specific rates included, with nothing estimated or hard-coded — set:
+
+```sh
+export COMMANDCODE_REAL_COST=1
+```
+
+With this flag every request is routed through the `/alpha/generate` transport, whose `provider-metadata` event reports the exact `inputInferenceCost` / `outputInferenceCost` / `cost` billed for that request. It applies to **any model** (switch models freely to compare real costs). The Provider API remains the default when the flag is unset.
+
+The generate protocol is text-only: a request that generate rejects before streaming any content (for example image input to a vision model) automatically falls back to the Provider API for that request, so nothing breaks — that request simply keeps the estimated cost. Requests that fail mid-stream after content was already delivered are surfaced as errors and never replayed through the other transport.
+
 ## Update and remove
 
 Update installed pi packages:
