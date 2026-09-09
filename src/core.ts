@@ -52,6 +52,14 @@ const DEFAULT_MAX_RETRIES = 0
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000
 const BASE_RETRY_DELAY_MS = 500
 
+// How long to keep reading the response after the "finish" event, waiting for
+// the trailing provider-metadata event that carries the REAL billed cost
+// (peak/off-peak aware). The gateway writes it immediately after "finish", so
+// when the two events straddle a network chunk boundary the next read delivers
+// it within milliseconds. If it never arrives (or the server hangs), the grace
+// period keeps the previous early-cancel behavior instead of stalling the turn.
+const PROVIDER_METADATA_WAIT_MS = 200
+
 function isRetryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status < 600)
 }
@@ -242,6 +250,42 @@ export function createStreamCommandCode(deps: CoreDependencies) {
     })
   }
 
+  /**
+   * Race a stream read against the provider-metadata grace period. Resolves
+   * "metadata-wait-timeout" when the grace expires with no data (the caller
+   * keeps the catalog estimate and ends the turn); rejects with AbortError
+   * when the attempt/outer signal aborts, mirroring raceAbort.
+   */
+  function raceReadGrace<T>(
+    promise: Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T | "metadata-wait-timeout"> {
+    return new Promise<T | "metadata-wait-timeout">((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer)
+        signal.removeEventListener("abort", onAbort)
+        reject(abortError("Aborted"))
+      }
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort)
+        resolve("metadata-wait-timeout")
+      }, PROVIDER_METADATA_WAIT_MS)
+      signal.addEventListener("abort", onAbort, { once: true })
+      promise.then(
+        (value) => {
+          clearTimeout(timer)
+          signal.removeEventListener("abort", onAbort)
+          resolve(value)
+        },
+        (error: unknown) => {
+          clearTimeout(timer)
+          signal.removeEventListener("abort", onAbort)
+          reject(error)
+        },
+      )
+    })
+  }
+
   return function streamCommandCode(
     model: ModelLike,
     context: ContextLike,
@@ -299,6 +343,11 @@ export function createStreamCommandCode(deps: CoreDependencies) {
         { contentIndex: number; toolCall: ToolCallContent; partialArgs: string }
       >()
       let finished = false
+      // Set when provider-metadata delivered the real billed cost over the
+      // off-peak catalog estimate computed on "finish".
+      let realCostCaptured = false
+      // Wall-clock limit for waiting on provider-metadata after "finish".
+      let metadataDeadline = 0
 
       const abortUpstream = () => {
         if (!controller.signal.aborted) controller.abort()
@@ -521,6 +570,7 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             }
             output.stopReason = mapFinishReason(event.finishReason)
             finished = true
+            metadataDeadline = Date.now() + PROVIDER_METADATA_WAIT_MS
             break
           }
 
@@ -529,12 +579,13 @@ export function createStreamCommandCode(deps: CoreDependencies) {
           // event, which arrives after "finish". The local catalog estimate in
           // "finish" is only off-peak and can drift from the actual bill, so
           // when real cost figures are present we overwrite usage.cost with
-          // them. The API reports the combined input inference cost but no
-          // fresh/cache split, so the fresh-input rate is derived from the
-          // real input cost minus cache reads billed at the model's catalog
-          // cacheRead rate (cache pricing does not vary by peak window). That
-          // derived rate is then applied to the fresh tokens; peak pricing
-          // (2x input/output) is captured automatically.
+          // them. The gateway bills the whole inference at one window rate
+          // (peak = 2x off-peak, cache reads included), so the window
+          // multiplier is derived from the real output cost — output is billed
+          // at a single per-token rate — and applied to the catalog input and
+          // cache rates. When no output was billed, fall back to billing cache
+          // reads at the catalog cacheRead rate and letting the fresh tokens
+          // absorb the remaining real input cost.
           case "provider-metadata": {
             const meta = isRecord(event.providerMetadata)
               ? isRecord(event.providerMetadata.gateway)
@@ -544,6 +595,7 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             const inputCost = toFiniteNumber(meta?.inputInferenceCost)
             const outputCost = toFiniteNumber(meta?.outputInferenceCost)
             if (meta && inputCost !== undefined && outputCost !== undefined) {
+              realCostCaptured = true
               const realInput = Math.max(0, inputCost)
               const realOutput = Math.max(0, outputCost)
               output.usage.cost.output = realOutput
@@ -552,23 +604,38 @@ export function createStreamCommandCode(deps: CoreDependencies) {
 
               const freshTokens = output.usage.input
               const cacheTokens = output.usage.cacheRead + output.usage.cacheWrite
-              const cacheRatePerToken = (model.cost?.cacheRead ?? 0) / 1_000_000
-              const cacheCost = cacheTokens * cacheRatePerToken
-              if (freshTokens > 0 && realInput >= cacheCost) {
-                // Derive the effective fresh-input rate (captures peak 2x
-                // automatically) and bill fresh tokens at it.
-                const freshRate = (realInput - cacheCost) / freshTokens
-                output.usage.cost.input = freshTokens * freshRate
-                output.usage.cost.cacheRead = cacheCost
-              } else if (freshTokens > 0) {
-                // Cache reads alone would exceed the reported input cost;
-                // fall back to token-share apportionment.
-                const share = freshTokens / (freshTokens + cacheTokens)
-                output.usage.cost.input = realInput * share
-                output.usage.cost.cacheRead = realInput * (1 - share)
+              const catalogInputRate = (model.cost?.input ?? 0) / 1_000_000
+              const catalogCacheRate = (model.cost?.cacheRead ?? 0) / 1_000_000
+
+              // Derive the window multiplier (1 off-peak, 2 peak) from the real
+              // output cost and scale the catalog input rates by it.
+              const catalogOutputCost =
+                output.usage.output > 0
+                  ? ((model.cost?.output ?? 0) / 1_000_000) * output.usage.output
+                  : 0
+              const multiplier =
+                catalogOutputCost > 0 && realOutput > 0 ? realOutput / catalogOutputCost : undefined
+              if (multiplier !== undefined && multiplier > 0) {
+                output.usage.cost.input = catalogInputRate * freshTokens * multiplier
+                output.usage.cost.cacheRead = catalogCacheRate * cacheTokens * multiplier
               } else {
-                output.usage.cost.input = 0
-                output.usage.cost.cacheRead = realInput
+                const cacheCost = cacheTokens * catalogCacheRate
+                if (freshTokens > 0 && realInput >= cacheCost) {
+                  // Derive the effective fresh-input rate (captures peak 2x
+                  // automatically) and bill fresh tokens at it.
+                  const freshRate = (realInput - cacheCost) / freshTokens
+                  output.usage.cost.input = freshTokens * freshRate
+                  output.usage.cost.cacheRead = cacheCost
+                } else if (freshTokens > 0) {
+                  // Cache reads alone would exceed the reported input cost;
+                  // fall back to token-share apportionment.
+                  const share = freshTokens / (freshTokens + cacheTokens)
+                  output.usage.cost.input = realInput * share
+                  output.usage.cost.cacheRead = realInput * (1 - share)
+                } else {
+                  output.usage.cost.input = 0
+                  output.usage.cost.cacheRead = realInput
+                }
               }
               // Guard against rounding drift so parts always sum to the real total.
               const parts = output.usage.cost.input + output.usage.cost.cacheRead
@@ -776,7 +843,21 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             try {
               readLoop: for (;;) {
                 if (controller.signal.aborted) throw abortError("Aborted")
-                const { done, value } = await raceAbort(reader.read(), attemptController.signal)
+                // "finish" ends the assistant turn, but the provider-metadata
+                // event carrying the REAL billed cost is emitted right after it
+                // and can straddle a network chunk boundary. Keep reading until
+                // the metadata is handled, the stream ends, or the short grace
+                // period elapses (some servers may not send it) — bailing at
+                // the first chunk boundary left usage.cost at the off-peak
+                // catalog estimate whenever the two events were split across
+                // chunks.
+                if (finished && (realCostCaptured || Date.now() >= metadataDeadline)) break
+                const read =
+                  finished && !realCostCaptured
+                    ? await raceReadGrace(reader.read(), attemptController.signal)
+                    : await raceAbort(reader.read(), attemptController.signal)
+                if (read === "metadata-wait-timeout") break
+                const { done, value } = read
                 if (done) {
                   if (buffer.trim()) handleEvent(parseStreamEventLine(buffer))
                   if (!finished) {
@@ -794,21 +875,7 @@ export function createStreamCommandCode(deps: CoreDependencies) {
 
                 for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
                   if (controller.signal.aborted) throw abortError("Aborted")
-                  const line = lines[lineIdx]
-                  handleEvent(parseStreamEventLine(line))
-                  // finish marks the logical end of the assistant turn, but the
-                  // provider-metadata event carrying the REAL billed cost is
-                  // emitted right after "finish" (often in the same network
-                  // chunk). Keep processing the remaining lines of this chunk
-                  // so that metadata is handled, then stop reading further
-                  // chunks (preserves early-cancel behavior on hanging servers).
-                  if (finished) {
-                    for (let restIdx = lineIdx + 1; restIdx < lines.length; restIdx++) {
-                      if (controller.signal.aborted) throw abortError("Aborted")
-                      handleEvent(parseStreamEventLine(lines[restIdx]))
-                    }
-                    break readLoop
-                  }
+                  handleEvent(parseStreamEventLine(lines[lineIdx]))
                 }
               }
             } catch (streamError: unknown) {
@@ -837,6 +904,8 @@ export function createStreamCommandCode(deps: CoreDependencies) {
                 output.stopReason = "stop"
                 output.errorMessage = undefined
                 finished = false
+                realCostCaptured = false
+                metadataDeadline = 0
                 const waitMs = attemptTimedOut ? 0 : retryDelayMs(attempt, null, maxRetryDelayMs)
                 if (waitMs > 0) await delay(waitMs, controller.signal)
                 continue retryLoop

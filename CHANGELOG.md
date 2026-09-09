@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fix the real billed cost (peak/off-peak aware) reported by `provider-metadata` being silently dropped whenever the event arrived in a later network chunk than `finish`: the generate-transport reader now keeps reading for a short grace period after `finish` instead of stopping at the chunk boundary, so `usage.cost` reflects the gateway bill (2x during peak hours) rather than the off-peak catalog estimate.
+- Attribute the real input inference cost across fresh and cache-read tokens with the window multiplier derived from the real output cost (the gateway bills cache reads at the peak rate too), keeping the derived per-token rates aligned with the actual bill.
+
 ## 0.6.4 - 2026-09-03
 
 - Refresh the generated Command Code capability catalog from `command-code@1.40.1` to `command-code@1.44.0`, adding current image-input, reasoning, effort, and output-limit metadata for newly published models.

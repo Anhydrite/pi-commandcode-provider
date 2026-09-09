@@ -237,12 +237,13 @@ describe("streamCommandCode — successful streams", () => {
     assert.equal(done.message.usage.totalTokens, 7672)
   })
 
-  it("captures peak input pricing from provider-metadata input cost", async () => {
-    // During peak hours deepseek-v4-flash input is 2x (0.44/M). The provider
-    // cannot know the window, but the derived fresh-input rate reflects it:
-    // fresh 100 tokens @ 0.44/M + cache 5000 tokens @ 0.007/M.
-    const inputCost = (100 / 1e6) * 0.44 + (5000 / 1e6) * 0.007
-    const outputCost = (40 / 1e6) * 0.66
+  it("captures peak pricing across input, cache, and output from provider-metadata", async () => {
+    // During peak hours the gateway bills the whole inference at 2x the
+    // off-peak catalog rates — cache reads included (verified against the
+    // live gateway). Model that here: fresh 100 tokens @ 0.44/M, cache 5000
+    // tokens @ 0.014/M (2x the 0.007 catalog rate), output 40 tokens @ 1.32/M.
+    const inputCost = (100 / 1e6) * 0.44 + (5000 / 1e6) * 0.014
+    const outputCost = (40 / 1e6) * 1.32
     server.mockResponse({
       type: "success",
       chunks: [
@@ -279,14 +280,75 @@ describe("streamCommandCode — successful streams", () => {
     const done = events.at(-1)
     assert.equal(done?.type, "done")
     if (done?.type !== "done") throw new Error("expected done")
-    // Cache at catalog rate; fresh cost carries the peak 2x premium.
-    const cacheCost = (5000 / 1e6) * 0.007
+    // The window multiplier (2x) is derived from the real output cost and
+    // applied to cache reads as well, so both components reflect peak pricing.
+    const cacheCost = (5000 / 1e6) * 0.014
     assert.ok(Math.abs(done.message.usage.cost.cacheRead - cacheCost) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.input - (inputCost - cacheCost)) < 1e-15)
+    assert.ok(Math.abs(done.message.usage.cost.output - outputCost) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.total - (inputCost + outputCost)) < 1e-15)
-    // The derived fresh rate must be ~0.44/M, i.e. 2x the 0.22 catalog rate.
-    const derivedRate = (done.message.usage.cost.input / done.message.usage.input) * 1e6
-    assert.ok(Math.abs(derivedRate - 0.44) < 1e-9)
+    // The derived fresh and cache rates must be 2x the catalog rates.
+    const derivedFreshRate = (done.message.usage.cost.input / done.message.usage.input) * 1e6
+    const derivedCacheRate = (done.message.usage.cost.cacheRead / done.message.usage.cacheRead) * 1e6
+    assert.ok(Math.abs(derivedFreshRate - 0.44) < 1e-9)
+    assert.ok(Math.abs(derivedCacheRate - 0.014) < 1e-9)
+  })
+
+  it("captures the real cost when provider-metadata arrives in a later network chunk", async () => {
+    // Regression: the real gateway emits "finish" and "provider-metadata" as
+    // separate SSE writes that can straddle a chunk boundary. The reader used
+    // to stop at the end of the chunk containing "finish", so provider-metadata
+    // was dropped and usage.cost stayed at the off-peak catalog estimate even
+    // during peak hours.
+    const usage = {
+      inputTokens: 7672,
+      outputTokens: 30,
+      inputTokenDetails: { noCacheTokens: 90, cacheReadTokens: 7552 },
+    }
+    const inputCost = (90 / 1e6) * 0.22 + (7552 / 1e6) * 0.007
+    const outputCost = (30 / 1e6) * 0.66
+    server.mockResponse({
+      type: "success",
+      // Two separate writes: finish first, then a 15ms gap, then metadata.
+      chunks: [
+        `${JSON.stringify({ type: "finish", finishReason: "stop", totalUsage: usage })}\n`,
+        `${JSON.stringify({
+          type: "provider-metadata",
+          providerMetadata: {
+            deepseek: {},
+            gateway: {
+              cost: String(inputCost + outputCost),
+              inferenceCost: String(inputCost + outputCost),
+              inputInferenceCost: String(inputCost),
+              outputInferenceCost: String(outputCost),
+              generationId: "gen_test_split_chunk",
+            },
+          },
+        })}\n`,
+      ],
+      delays: [0, 15],
+    })
+    const { streamCommandCode } = createTestDeps({ apiBase: server.baseUrl() })
+    const events = await collectEvents(
+      streamCommandCode(
+        makeModel({ cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 } }),
+        makeContext(),
+        { apiKey: "mock-key" },
+      ),
+    )
+    const done = events.at(-1)
+    assert.equal(done?.type, "done")
+    if (done?.type !== "done") throw new Error("expected done")
+    // Real total from provider-metadata (input 0.000072664 + output 0.0000198).
+    assert.ok(Math.abs(done.message.usage.cost.total - (inputCost + outputCost)) < 1e-15)
+    assert.ok(Math.abs(done.message.usage.cost.output - outputCost) < 1e-15)
+    const cacheCost = (7552 / 1e6) * 0.007
+    const freshCost = inputCost - cacheCost
+    assert.ok(Math.abs(done.message.usage.cost.cacheRead - cacheCost) < 1e-15)
+    assert.ok(Math.abs(done.message.usage.cost.input - freshCost) < 1e-15)
+    assert.equal(done.message.usage.input, 90)
+    assert.equal(done.message.usage.cacheRead, 7552)
+    assert.equal(done.message.usage.totalTokens, 7672)
   })
 
   it("sends images for vision-capable models", async () => {
