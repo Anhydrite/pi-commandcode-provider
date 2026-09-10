@@ -253,7 +253,7 @@ export function createStreamCommandCode(deps: CoreDependencies) {
   /**
    * Race a stream read against the provider-metadata grace period. Resolves
    * "metadata-wait-timeout" when the grace expires with no data (the caller
-   * keeps the catalog estimate and ends the turn); rejects with AbortError
+   * keeps usage.cost at zero and ends the turn); rejects with AbortError
    * when the attempt/outer signal aborts, mirroring raceAbort.
    */
   function raceReadGrace<T>(
@@ -343,8 +343,8 @@ export function createStreamCommandCode(deps: CoreDependencies) {
         { contentIndex: number; toolCall: ToolCallContent; partialArgs: string }
       >()
       let finished = false
-      // Set when provider-metadata delivered the real billed cost over the
-      // off-peak catalog estimate computed on "finish".
+      // Set when provider-metadata delivered the real billed cost. Until then
+      // usage.cost stays at zero: nothing is estimated.
       let realCostCaptured = false
       // Wall-clock limit for waiting on provider-metadata after "finish".
       let metadataDeadline = 0
@@ -574,18 +574,19 @@ export function createStreamCommandCode(deps: CoreDependencies) {
             break
           }
 
-          // Command Code reports the REAL billed cost (including peak pricing
-          // and model-specific gateway rates) in the final provider-metadata
-          // event, which arrives after "finish". The local catalog estimate in
-          // "finish" is only off-peak and can drift from the actual bill, so
-          // when real cost figures are present we overwrite usage.cost with
-          // them. The gateway bills the whole inference at one window rate
-          // (peak = 2x off-peak, cache reads included), so the window
-          // multiplier is derived from the real output cost — output is billed
-          // at a single per-token rate — and applied to the catalog input and
-          // cache rates. When no output was billed, fall back to billing cache
-          // reads at the catalog cacheRead rate and letting the fresh tokens
-          // absorb the remaining real input cost.
+          // Command Code reports the REAL billed cost in the final
+          // provider-metadata event, which arrives after "finish". That report
+          // is the only cost source: this extension ships no rate card (a local
+          // one drifted from the bill), so nothing is estimated and nothing is
+          // attributed.
+          //
+          // The gateway bills two amounts: one for the input side of the request
+          // (fresh tokens and cache reads together) and one for the output side.
+          // It never reports the fresh/cache split, so `cost.input` holds the
+          // whole input-side amount and `cost.cacheRead` / `cost.cacheWrite`
+          // stay at zero. Consumers must not read those zeros as "cache is
+          // free": read `cost.input` as the input side and `cost.output` as the
+          // output side.
           case "provider-metadata": {
             const meta = isRecord(event.providerMetadata)
               ? isRecord(event.providerMetadata.gateway)
@@ -598,52 +599,11 @@ export function createStreamCommandCode(deps: CoreDependencies) {
               realCostCaptured = true
               const realInput = Math.max(0, inputCost)
               const realOutput = Math.max(0, outputCost)
+              output.usage.cost.input = realInput
               output.usage.cost.output = realOutput
+              output.usage.cost.cacheRead = 0
               output.usage.cost.cacheWrite = 0
               output.usage.cost.total = realInput + realOutput
-
-              const freshTokens = output.usage.input
-              const cacheTokens = output.usage.cacheRead + output.usage.cacheWrite
-              const catalogInputRate = (model.cost?.input ?? 0) / 1_000_000
-              const catalogCacheRate = (model.cost?.cacheRead ?? 0) / 1_000_000
-
-              // Derive the window multiplier (1 off-peak, 2 peak) from the real
-              // output cost and scale the catalog input rates by it.
-              const catalogOutputCost =
-                output.usage.output > 0
-                  ? ((model.cost?.output ?? 0) / 1_000_000) * output.usage.output
-                  : 0
-              const multiplier =
-                catalogOutputCost > 0 && realOutput > 0 ? realOutput / catalogOutputCost : undefined
-              if (multiplier !== undefined && multiplier > 0) {
-                output.usage.cost.input = catalogInputRate * freshTokens * multiplier
-                output.usage.cost.cacheRead = catalogCacheRate * cacheTokens * multiplier
-              } else {
-                const cacheCost = cacheTokens * catalogCacheRate
-                if (freshTokens > 0 && realInput >= cacheCost) {
-                  // Derive the effective fresh-input rate (captures peak 2x
-                  // automatically) and bill fresh tokens at it.
-                  const freshRate = (realInput - cacheCost) / freshTokens
-                  output.usage.cost.input = freshTokens * freshRate
-                  output.usage.cost.cacheRead = cacheCost
-                } else if (freshTokens > 0) {
-                  // Cache reads alone would exceed the reported input cost;
-                  // fall back to token-share apportionment.
-                  const share = freshTokens / (freshTokens + cacheTokens)
-                  output.usage.cost.input = realInput * share
-                  output.usage.cost.cacheRead = realInput * (1 - share)
-                } else {
-                  output.usage.cost.input = 0
-                  output.usage.cost.cacheRead = realInput
-                }
-              }
-              // Guard against rounding drift so parts always sum to the real total.
-              const parts = output.usage.cost.input + output.usage.cost.cacheRead
-              if (parts !== realInput && parts > 0) {
-                const scale = realInput / parts
-                output.usage.cost.input *= scale
-                output.usage.cost.cacheRead *= scale
-              }
             }
             break
           }
@@ -848,9 +808,8 @@ export function createStreamCommandCode(deps: CoreDependencies) {
                 // and can straddle a network chunk boundary. Keep reading until
                 // the metadata is handled, the stream ends, or the short grace
                 // period elapses (some servers may not send it) — bailing at
-                // the first chunk boundary left usage.cost at the off-peak
-                // catalog estimate whenever the two events were split across
-                // chunks.
+                // the first chunk boundary left usage.cost at zero whenever the
+                // two events were split across chunks.
                 if (finished && (realCostCaptured || Date.now() >= metadataDeadline)) break
                 const read =
                   finished && !realCostCaptured

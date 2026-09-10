@@ -177,10 +177,9 @@ describe("streamCommandCode — successful streams", () => {
 
   it("overwrites usage.cost with the real billed cost from provider-metadata", async () => {
     // Simulate the real Command Code stream: finish reports token usage, then
-    // the trailing provider-metadata event reports the actual billed cost
-    // (which includes peak pricing and gateway rates). The numbers below are
-    // self-consistent with deepseek-v4-flash rates: fresh 90 tokens @ 0.22/M,
-    // cache 7552 tokens @ 0.007/M, output 30 tokens @ 0.66/M.
+    // the trailing provider-metadata event reports the actual billed cost.
+    // The gateway bills one input-side amount (fresh tokens AND cache reads
+    // together) and one output-side amount; it never reports the split.
     server.mockResponse({
       type: "success",
       chunks: [
@@ -221,27 +220,25 @@ describe("streamCommandCode — successful streams", () => {
     assert.equal(done?.type, "done")
     if (done?.type !== "done") throw new Error("expected done")
 
-    // Real total from provider-metadata (input 0.000072664 + output 0.0000198)
+    // The billed amounts land unchanged; the input side is not split, so the
+    // cache components stay at zero and must not be read as "cache is free".
     assert.ok(Math.abs(done.message.usage.cost.total - 0.000092464) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.output - 0.0000198) < 1e-15)
-    // Cache reads billed at the model catalog cacheRead rate (0.007/M); the
-    // remaining input cost is attributed to fresh tokens at the derived rate
-    // (which captures peak pricing automatically).
-    const cacheCost = (7552 / 1e6) * 0.007
-    const freshCost = 0.000072664 - cacheCost
-    assert.ok(Math.abs(done.message.usage.cost.cacheRead - cacheCost) < 1e-15)
-    assert.ok(Math.abs(done.message.usage.cost.input - freshCost) < 1e-15)
+    assert.ok(Math.abs(done.message.usage.cost.input - 0.000072664) < 1e-15)
+    assert.equal(done.message.usage.cost.cacheRead, 0)
+    assert.equal(done.message.usage.cost.cacheWrite, 0)
     // Token accounting must be untouched by the real-cost overwrite.
     assert.equal(done.message.usage.input, 90)
     assert.equal(done.message.usage.cacheRead, 7552)
     assert.equal(done.message.usage.totalTokens, 7672)
   })
 
-  it("captures peak pricing across input, cache, and output from provider-metadata", async () => {
-    // During peak hours the gateway bills the whole inference at 2x the
-    // off-peak catalog rates — cache reads included (verified against the
-    // live gateway). Model that here: fresh 100 tokens @ 0.44/M, cache 5000
-    // tokens @ 0.014/M (2x the 0.007 catalog rate), output 40 tokens @ 1.32/M.
+  it("records the billed amounts verbatim and ignores any catalog rates", async () => {
+    // Peak window (verified against the live gateway): fresh 100 tokens
+    // @ $0.44/M, cache 5000 tokens @ $0.014/M, output 40 tokens @ $1.32/M, all
+    // billed as one input-side and one output-side amount. The model object
+    // below still carries catalog rates on purpose: nothing may be derived
+    // from them.
     const inputCost = (100 / 1e6) * 0.44 + (5000 / 1e6) * 0.014
     const outputCost = (40 / 1e6) * 1.32
     server.mockResponse({
@@ -280,19 +277,16 @@ describe("streamCommandCode — successful streams", () => {
     const done = events.at(-1)
     assert.equal(done?.type, "done")
     if (done?.type !== "done") throw new Error("expected done")
-    // The window multiplier (2x) is derived from the real output cost and
-    // applied to cache reads as well, so both components reflect peak pricing.
-    const cacheCost = (5000 / 1e6) * 0.014
-    assert.ok(Math.abs(done.message.usage.cost.cacheRead - cacheCost) < 1e-15)
-    assert.ok(Math.abs(done.message.usage.cost.input - (inputCost - cacheCost)) < 1e-15)
+    // The gateway's peak amounts are recorded exactly as reported.
+    assert.ok(Math.abs(done.message.usage.cost.input - inputCost) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.output - outputCost) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.total - (inputCost + outputCost)) < 1e-15)
-    // The derived fresh and cache rates must be 2x the catalog rates.
-    const derivedFreshRate = (done.message.usage.cost.input / done.message.usage.input) * 1e6
-    const derivedCacheRate =
-      (done.message.usage.cost.cacheRead / done.message.usage.cacheRead) * 1e6
-    assert.ok(Math.abs(derivedFreshRate - 0.44) < 1e-9)
-    assert.ok(Math.abs(derivedCacheRate - 0.014) < 1e-9)
+    // No split is attributed, even though the model carried catalog rates.
+    assert.equal(done.message.usage.cost.cacheRead, 0)
+    assert.equal(done.message.usage.cost.cacheWrite, 0)
+    // Token accounting is untouched by the cost overwrite.
+    assert.equal(done.message.usage.input, 100)
+    assert.equal(done.message.usage.cacheRead, 5000)
   })
 
   it("captures the real cost when provider-metadata arrives in a later network chunk", async () => {
@@ -340,13 +334,11 @@ describe("streamCommandCode — successful streams", () => {
     const done = events.at(-1)
     assert.equal(done?.type, "done")
     if (done?.type !== "done") throw new Error("expected done")
-    // Real total from provider-metadata (input 0.000072664 + output 0.0000198).
+    // The billed amounts from provider-metadata land unchanged.
     assert.ok(Math.abs(done.message.usage.cost.total - (inputCost + outputCost)) < 1e-15)
     assert.ok(Math.abs(done.message.usage.cost.output - outputCost) < 1e-15)
-    const cacheCost = (7552 / 1e6) * 0.007
-    const freshCost = inputCost - cacheCost
-    assert.ok(Math.abs(done.message.usage.cost.cacheRead - cacheCost) < 1e-15)
-    assert.ok(Math.abs(done.message.usage.cost.input - freshCost) < 1e-15)
+    assert.ok(Math.abs(done.message.usage.cost.input - inputCost) < 1e-15)
+    assert.equal(done.message.usage.cost.cacheRead, 0)
     assert.equal(done.message.usage.input, 90)
     assert.equal(done.message.usage.cacheRead, 7552)
     assert.equal(done.message.usage.totalTokens, 7672)

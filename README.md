@@ -139,29 +139,52 @@ The following environment variables are intended for tests, local mocks, and com
 
 ## Image input
 
-The provider advertises image input only for models marked with the `image` input modality in the official Command Code CLI model catalog. The capability snapshot currently follows `command-code@1.44.0`; unknown models default to text-only until their upstream metadata is reviewed. A daily GitHub Actions job synchronizes the CLI version, image capabilities, reasoning flags, reasoning efforts, and model-specific output limits with the latest published CLI package and opens or updates a reviewable pull request when they change. Pricing remains manually reviewed because temporary promotions and long-context tiers require explicit review.
+The provider advertises image input only for models marked with the `image` input modality in the official Command Code CLI model catalog. The capability snapshot currently follows `command-code@1.44.0`; unknown models default to text-only until their upstream metadata is reviewed. A daily GitHub Actions job synchronizes the CLI version, image capabilities, reasoning flags, reasoning efforts, and model-specific output limits with the latest published CLI package and opens or updates a reviewable pull request when they change. No pricing is tracked locally: billed amounts come from the gateway (see [Cost](#cost)).
 
 For vision-capable models, Pi's native provider adapters forward image blocks from user messages and tool results using the documented OpenAI or Anthropic message schema. Unknown and text-only models remain marked text-only in Pi.
 
-## Pricing display
+## Cost
 
-The Command Code Provider API does not currently include prices in its model catalog. This extension therefore keeps a static table for models with known prices so pi can display estimated request costs. DeepSeek V4 uses time-dependent rates; pi displays the documented off-peak rate, which applies for 17 hours per day.
+This extension ships **no rate card**. The Command Code provider API returns no
+prices at all (its model catalog carries ids, names, and context windows only),
+and a locally hard-coded table drifts: the removed table still charged DeepSeek
+V4 Flash at a stale off-peak rate while the gateway billed it at 2x during the
+published peak windows.
 
-Models missing from that table display zero cost in pi. This does **not** mean that Command Code will bill the request at zero. The Command Code Usage page remains authoritative for each request. Check the current [Command Code pricing](https://commandcode.ai/docs/resources/pricing-limits) before relying on the displayed value.
+Cost therefore has exactly one source: the amount the gateway says it billed.
+Every request is routed through the `/alpha/generate` transport, whose
+`provider-metadata` event reports the exact `inputInferenceCost` /
+`outputInferenceCost` (peak/off-peak windows, gateway and model-specific rates
+included). Pi stores that in `usage.cost`.
 
-## Real request cost (opt-in)
+It applies to **any model** — switch models freely to compare real costs.
 
-The estimated costs above come from a static local table, and the Provider API does not return billing figures. If you want pi to record the **real billed cost** for every request — peak/off-peak windows, gateway and model-specific rates included, with nothing estimated or hard-coded — toggle it inside pi:
+Models are declared at zero cost, so before the gateway reports an amount (and
+whenever it never reports one) pi displays **no cost** instead of an estimate.
+Zero here means "not known", not "free": check the Command Code usage page for
+what a specific request was billed.
+
+### Opting out
+
+The Provider API (native OpenAI/Anthropic-compatible transport) can be preferred
+instead:
 
 ```
-/commandcode-realcost        (toggle on/off, or: /commandcode-realcost on|off)
+/commandcode-realcost off     (or: /commandcode-realcost on|off, or no argument to toggle)
 ```
 
-The choice is persisted in `~/.pi/agent/settings.json` (`commandcodeRealCost`) and applies to the next request — no restart needed. For headless runs you can also set `COMMANDCODE_REAL_COST=1` as the initial default when no setting is saved yet.
+The choice is persisted in `~/.pi/agent/settings.json` (`commandcodeRealCost`)
+and applies to the next request — no restart needed. For headless runs you can
+set `COMMANDCODE_REAL_COST=0` as the initial default when no setting is saved
+yet; `COMMANDCODE_REAL_COST=1` forces the real cost back on, and any unset,
+empty, or unrecognized value keeps the default (real cost ON). A saved setting
+always wins over the environment variable.
 
-With the mode on, every request is routed through the `/alpha/generate` transport, whose `provider-metadata` event reports the exact `inputInferenceCost` / `outputInferenceCost` / `cost` billed for that request. It applies to **any model** (switch models freely to compare real costs). The Provider API remains the default when the mode is off.
+With the mode off no cost is recorded: the Provider API does not report billing
+figures and this extension no longer guesses them, so pi shows no cost at all
+for those requests.
 
-The generate protocol is text-only: a request that generate rejects before streaming any content (for example image input to a vision model) automatically falls back to the Provider API for that request, so nothing breaks — that request simply keeps the estimated cost. Requests that fail mid-stream after content was already delivered are surfaced as errors and never replayed through the other transport.
+The generate protocol is text-only: a request that generate rejects before streaming any content (for example image input to a vision model) automatically falls back to the Provider API for that request, so nothing breaks — that particular request simply reports no cost. Requests that fail mid-stream after content was already delivered are surfaced as errors and never replayed through the other transport.
 
 ## Update and remove
 

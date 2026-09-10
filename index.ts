@@ -19,7 +19,7 @@ import { join } from "node:path"
 import { getConfiguredApiKey } from "./src/api-key.ts"
 import { pickCommandCodeApiKey, withResolvedCommandCodeApiKey } from "./src/converters.ts"
 import { createStreamCommandCode } from "./src/core.ts"
-import { calculateCommandCodeCost } from "./src/cost.ts"
+import { calculateCommandCodeCostPlaceholder } from "./src/cost-placeholder.ts"
 import {
   apiForModelId,
   baseUrlForModel,
@@ -35,13 +35,25 @@ import {
 } from "./src/models.ts"
 import { getApiKey as getOAuthApiKey, login, refreshToken } from "./src/oauth.ts"
 import { normalizeCommandCodeMessage } from "./src/overflow.ts"
-import { MODEL_COSTS, ZERO_MODEL_COST } from "./src/pricing.ts"
 import { registerCommandCodeQuota } from "./src/quota-command.ts"
 import { loadRealCostEnabled, saveRealCostEnabled } from "./src/real-cost.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
 
 const COMMAND_CODE_API = "commandcode-custom"
+
+/**
+ * Cost credited to a model before the gateway reports what it billed.
+ *
+ * Command Code publishes no per-model prices through its API (the provider
+ * catalog carries ids and context windows only), and a hard-coded rate card
+ * drifted from the real bill (it billed DeepSeek V4 Flash at 2x during peak
+ * hours while the table held a stale off-peak rate). So nothing is estimated:
+ * every model is declared at zero cost and `usage.cost` is written exclusively
+ * by the gateway's `provider-metadata` event. When that event never arrives the
+ * cost stays zero, which pi renders as "no cost" rather than a made-up figure.
+ */
+const UNPRICED_MODEL_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 const COMPAT_SOURCE_ID = "pi-commandcode-provider"
 
 type CompatStreamFunction = (
@@ -126,7 +138,7 @@ function createProviderConfig(
       reasoning: model.reasoning,
       ...(thinkingMetadataForModel(model.id) ?? {}),
       input: [...inputModalitiesForModel(model.id)],
-      cost: MODEL_COSTS[model.id] ?? ZERO_MODEL_COST,
+      cost: UNPRICED_MODEL_COST,
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       headers,
@@ -159,15 +171,15 @@ export default async function (pi: ExtensionAPI) {
   const modelsTimeoutMs = getModelsTimeoutMs()
   const modelsCachePath =
     process.env.COMMANDCODE_MODELS_CACHE ?? join(getAgentDir(), "commandcode-models.json")
-  // Opt into routing every request through /alpha/generate so the real billed
-  // cost (peak/off-peak, gateway and model-specific rates) is returned by the
-  // API in provider-metadata for ANY model. Without it the Provider API is
-  // preferred and costs stay a local estimate. Toggle with /commandcode-realcost
-  // (persisted) or set COMMANDCODE_REAL_COST=1 as the initial default.
+  // Real billed cost is the default: route every request through
+  // /alpha/generate so the API reports what it actually charged in
+  // provider-metadata (peak/off-peak, gateway and model-specific rates).
+  // `/commandcode-realcost off` (persisted) or COMMANDCODE_REAL_COST=0 opts out
+  // and falls back to the Provider API's local off-peak catalog estimate.
   const realCost = { enabled: await loadRealCostEnabled() }
   const streamGenerate = createStreamCommandCode({
     createStream: () => new AssistantMessageEventStream(),
-    calculateCost: calculateCommandCodeCost,
+    calculateCost: calculateCommandCodeCostPlaceholder,
     apiBase: legacyApiBase(apiBase),
   })
   const resolveStreamOptions = (options?: Parameters<typeof streamNativeProvider>[2]) =>
@@ -186,7 +198,8 @@ export default async function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("commandcode-realcost", {
-    description: "Toggle real billed request cost (route all models through /alpha/generate)",
+    description:
+      "Toggle real billed request cost (default ON; routes all models through /alpha/generate)",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase()
       const next =
@@ -201,7 +214,7 @@ export default async function (pi: ExtensionAPI) {
       ctx.ui.notify(
         next
           ? "Real request cost ON: every request now routes through /alpha/generate and records its real billed cost (peak/off-peak included)."
-          : "Real request cost OFF: Provider API preferred, costs are local estimates.",
+          : "Real request cost OFF: the Provider API is preferred and costs are local off-peak estimates again. Run /commandcode-realcost on to restore the real billed cost.",
         "info",
       )
     },

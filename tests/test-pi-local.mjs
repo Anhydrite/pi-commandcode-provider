@@ -63,6 +63,14 @@ if (piCheck.error) {
 }
 
 let requestCount = 0
+// Real billed cost is the default transport, so this suite pins the Provider
+// API explicitly (COMMANDCODE_REAL_COST=0 in the base env below) to keep
+// asserting provider request shapes; `requestCount` therefore counts Provider
+// API requests only. The default generate transport has its own case at the
+// end of the suite (`generateRequestCount`).
+let generateRequestCount = 0
+let lastGenerateBody
+let lastGenerateHeaders = {}
 let modelListRequestCount = 0
 let lastRequestBody
 let lastRequestHeaders = {}
@@ -112,7 +120,11 @@ function modelCatalog() {
 }
 
 const server = createServer((req, res) => {
-  if (req.method === "GET" && req.url === "/provider/v1/models") {
+  // pi appends query flags to some routes (e.g. the Anthropic endpoint gets
+  // `?beta=true`), so route on the pathname only.
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname
+
+  if (req.method === "GET" && pathname === "/provider/v1/models") {
     modelListRequestCount += 1
     const respond = () => {
       if (res.destroyed) return
@@ -124,8 +136,59 @@ const server = createServer((req, res) => {
     return
   }
 
-  const isOpenAIRequest = req.method === "POST" && req.url === "/provider/v1/chat/completions"
-  const isAnthropicRequest = req.method === "POST" && req.url === "/provider/v1/messages"
+  const isOpenAIRequest = req.method === "POST" && pathname === "/provider/v1/chat/completions"
+  const isAnthropicRequest = req.method === "POST" && pathname === "/provider/v1/messages"
+  const isGenerateRequest = req.method === "POST" && pathname === "/alpha/generate"
+
+  if (isGenerateRequest) {
+    generateRequestCount += 1
+    lastGenerateHeaders = Object.fromEntries(
+      Object.entries(req.headers).map(([key, value]) => [
+        key,
+        Array.isArray(value) ? value.join(", ") : (value ?? ""),
+      ]),
+    )
+    let generateBody = ""
+    req.on("data", (chunk) => {
+      generateBody += chunk.toString("utf-8")
+    })
+    req.on("end", () => {
+      try {
+        lastGenerateBody = JSON.parse(generateBody)
+      } catch {
+        lastGenerateBody = undefined
+      }
+      // Command Code generate protocol: newline-delimited JSON events, with the
+      // real billed cost trailing in `provider-metadata`.
+      res.writeHead(200, {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Transfer-Encoding": "chunked",
+      })
+      res.write(`${JSON.stringify({ type: "text-delta", text: "mock-pi-ok" })}\n`)
+      res.write(
+        `${JSON.stringify({
+          type: "finish",
+          finishReason: "stop",
+          totalUsage: {
+            inputTokens: 100,
+            outputTokens: 2,
+            inputTokenDetails: { noCacheTokens: 100, cacheReadTokens: 0 },
+          },
+        })}\n`,
+      )
+      res.write(
+        `${JSON.stringify({
+          type: "provider-metadata",
+          providerMetadata: {
+            gateway: { inputInferenceCost: 0.000015, outputInferenceCost: 0.00000132 },
+          },
+        })}\n`,
+      )
+      res.end()
+    })
+    return
+  }
+
   if (!isOpenAIRequest && !isAnthropicRequest) {
     res.writeHead(404)
     res.end("Not found")
@@ -232,6 +295,10 @@ const env = {
   COMMAND_CODE_API_KEY: "mock-key",
   CMD_ZDR: "1",
   COMMANDCODE_MODELS_URL: `${apiBase}/provider/v1/models`,
+  // Real billed cost (the generate transport) is the extension default. This
+  // suite asserts Provider API request shapes, so it opts out here and covers
+  // the default in the dedicated case at the end of the suite.
+  COMMANDCODE_REAL_COST: "0",
 }
 
 function runPi(args, timeoutOrOptions = 30_000) {
@@ -1023,6 +1090,38 @@ try {
   assert.equal(overflowRpc.sawCompactionRetry, true, JSON.stringify(overflowRpc))
   assert.equal(overflowRpc.stderrHasSecrets, false)
   overflowMode = false
+
+  console.log("[pi-local] real billed cost is the default transport")
+  // No COMMANDCODE_REAL_COST override: the extension default must route the
+  // request through /alpha/generate so the gateway's real billed cost is
+  // recorded, instead of the Provider API's off-peak catalog estimate.
+  requestCount = 0
+  generateRequestCount = 0
+  lastGenerateBody = undefined
+  const realCostPrint = await runPi(
+    [
+      "--no-extensions",
+      "-e",
+      EXT_PATH,
+      "-p",
+      "say mock token",
+      "--provider",
+      "commandcode",
+      "--model",
+      TEST_MODEL,
+    ],
+    { timeoutMs: 30_000, env: { COMMANDCODE_REAL_COST: undefined } },
+  )
+  assert.equal(realCostPrint.code, 0, realCostPrint.stderr)
+  assert.match(realCostPrint.stdout, /mock-pi-ok/)
+  assert.equal(generateRequestCount, 1, "the default must use the generate transport")
+  assert.equal(requestCount, 0, "the default must not fall back to the Provider API")
+  assert.equal(lastGenerateBody?.params?.model, TEST_MODEL)
+  assert.ok(
+    typeof lastGenerateHeaders.authorization === "string" &&
+      lastGenerateHeaders.authorization.startsWith("Bearer "),
+    "the generate request should carry the bearer Authorization header",
+  )
 
   console.log("[pi-local] PASS")
 } finally {
