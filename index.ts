@@ -38,6 +38,7 @@ import { normalizeCommandCodeMessage } from "./src/overflow.ts"
 import { registerCommandCodeQuota } from "./src/quota-command.ts"
 import { loadRealCostEnabled, saveRealCostEnabled } from "./src/real-cost.ts"
 import { createCommandCodeRuntime } from "./src/runtime.ts"
+import { transcriptReadersFrom, withTranscriptPromptAndTools } from "./src/transcript.ts"
 import { createCommandCodeTransportRouter } from "./src/transport.ts"
 
 const COMMAND_CODE_API = "commandcode-custom"
@@ -177,6 +178,12 @@ export default async function (pi: ExtensionAPI) {
   // `/commandcode-realcost off` (persisted) or COMMANDCODE_REAL_COST=0 opts out
   // and falls back to the Provider API's local off-peak catalog estimate.
   const realCost = { enabled: await loadRealCostEnabled() }
+  // pi 0.86+ hands providers a TranscriptContext: the prompt and tool
+  // declarations live in transcript system messages, and the top-level
+  // `systemPrompt`/`tools` fields are undefined. The generate transport builds
+  // its own request body, so it must replay them itself; otherwise the request
+  // declares no tools and models write tool calls as plain text.
+  const transcriptReaders = transcriptReadersFrom(piAiCompat)
   const streamGenerate = createStreamCommandCode({
     createStream: () => new AssistantMessageEventStream(),
     calculateCost: calculateCommandCodeCostPlaceholder,
@@ -193,7 +200,11 @@ export default async function (pi: ExtensionAPI) {
         resolveStreamOptions(options),
       ),
     streamGenerate: (model, context, options) =>
-      streamGenerate(model, context, resolveStreamOptions(options)),
+      streamGenerate(
+        model,
+        withTranscriptPromptAndTools(context, transcriptReaders),
+        resolveStreamOptions(options),
+      ),
     preferGenerate: () => realCost.enabled,
   })
 
