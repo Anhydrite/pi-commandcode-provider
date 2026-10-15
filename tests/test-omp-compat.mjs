@@ -52,6 +52,7 @@ const tempHome = mkdtempSync(join(tmpdir(), "omp-cc-home-"))
 let requestCount = 0
 let modelListRequestCount = 0
 let lastRequestBody
+let lastGenerateBody
 let requestBodies = []
 let lastRequestHeaders = {}
 // When true the mock Provider API answers 403 upgrade_required so the
@@ -153,10 +154,14 @@ const server = createServer((req, res) => {
   })
   req.on("end", () => {
     try {
-      lastRequestBody = JSON.parse(generateBody)
-      requestBodies.push(lastRequestBody)
+      // The generate transport wraps the request in Command Code's own shape
+      // (`params.model`, `params.messages`), not the OpenAI/Anthropic body the
+      // Provider API receives. Keep them apart so each assertion reads the
+      // field that transport actually sends.
+      lastGenerateBody = JSON.parse(generateBody)
+      requestBodies.push(lastGenerateBody)
     } catch {
-      lastRequestBody = undefined
+      lastGenerateBody = undefined
     }
 
     res.writeHead(200, {
@@ -328,6 +333,7 @@ try {
   console.log("[omp-compat] print mode through real extension and mock API")
   requestCount = 0
   requestBodies = []
+  lastGenerateBody = undefined
   const print = await runOmp(
     ["-e", EXT_PATH, "-p", "say mock token", "--model", `commandcode/${TEST_MODEL}`],
     30_000,
@@ -340,8 +346,8 @@ try {
     "Bearer mock-key",
     "should send the resolved env-var value, not the literal var name",
   )
-  assert.equal(lastRequestBody?.model, TEST_MODEL)
-  assert.ok(Array.isArray(lastRequestBody?.messages))
+  assert.equal(lastGenerateBody?.params?.model, TEST_MODEL)
+  assert.ok(Array.isArray(lastGenerateBody?.params?.messages))
 
   // OMP stores `/login` credentials in agent.db and consults them only when
   // the extension does not install a config API key. main registered the

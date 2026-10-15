@@ -186,7 +186,7 @@ export default async function (pi: ExtensionAPI) {
   // provider-metadata (peak/off-peak, gateway and model-specific rates).
   // `/commandcode-realcost off` (persisted) or COMMANDCODE_REAL_COST=0 opts out
   // and falls back to the Provider API's local off-peak catalog estimate.
-  const realCost = { enabled: await loadRealCostEnabled() }
+  const realCost = { enabled: await loadRealCostEnabled(getAgentDir()) }
   // pi 0.86+ hands providers a TranscriptContext: the prompt and tool
   // declarations live in transcript system messages, and the top-level
   // `systemPrompt`/`tools` fields are undefined. The generate transport builds
@@ -229,7 +229,7 @@ export default async function (pi: ExtensionAPI) {
             ? false
             : !realCost.enabled
       realCost.enabled = next
-      await saveRealCostEnabled(next)
+      await saveRealCostEnabled(getAgentDir(), next)
       await ctx.waitForIdle?.()
       ctx.ui.notify(
         next
