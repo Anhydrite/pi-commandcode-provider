@@ -6,7 +6,7 @@ import {
   diffModelMetadata,
   hasModelMetadataDiff,
   parseBundleModelCapabilities,
-  parseKnownTextOnlyModelIds,
+  parseEmbeddedModelCatalog,
   parseModelsReference,
   parsePackageVersion,
   pruneObsoleteEffortOverrides,
@@ -37,8 +37,17 @@ const MODELS_REFERENCE = `
 | \`text-model\` | Text | 200K | — | $1/$2 | Go | text |
 `
 
-const CLI_BUNDLE =
-  'const V={id:"vision-model",inputModalities:["text","image"],reasoning:!0,reasoningEfforts:["low","high"],maxOutputTokens:32768},T={id:"text-model",inputModalities:["text"]},catalog=new Set(["text-model"]),__name(isKnownTextOnlyModel,"isKnownTextOnlyModel")'
+const CLI_BUNDLE = [
+  'const T=1,En={catalogVersion:"abc",data:[',
+  '{aliases:[],behaviorProfile:"standard-v1",context_length:2e5,display:{label:"Text"},',
+  'id:"text-model",inputModalities:["text"],maxOutputTokens:null,name:"Text",object:"model",',
+  'owned_by:"command-code",reasoningEfforts:null},',
+  '{aliases:[],behaviorProfile:"standard-v1",context_length:1e6,display:{label:"Vision"},',
+  'id:"vision-model",inputModalities:["text","image"],maxOutputTokens:32768,name:"Vision",',
+  'object:"model",owned_by:"command-code",reasoning:!0,reasoningEfforts:["low","high"]}]}',
+  'const NL={VISION:{id:"vision-model",inputModalities:["text","image"],reasoning:!0,',
+  'reasoningEfforts:["low","high"],contextWindow:1e6}}',
+].join("")
 
 describe("Command Code model metadata checker", () => {
   it("parses model ids and reasoning efforts from the generated reference", () => {
@@ -48,8 +57,15 @@ describe("Command Code model metadata checker", () => {
     })
   })
 
-  it("extracts the text-only set from the bundled CLI catalog", () => {
-    assert.deepEqual(parseKnownTextOnlyModelIds(CLI_BUNDLE), ["text-model"])
+  it("derives entries from the bundled CLI catalog without a fixed anchor", () => {
+    const catalog = parseEmbeddedModelCatalog(CLI_BUNDLE, ["text-model", "vision-model"])
+    assert.deepEqual(catalog["vision-model"], {
+      inputModalities: ["text", "image"],
+      reasoning: true,
+      reasoningEfforts: ["low", "high"],
+      maxOutputTokens: 32_768,
+    })
+    assert.deepEqual(catalog["text-model"], { inputModalities: ["text"], reasoning: false })
   })
 
   it("accepts one exact npm registry version and rejects stale-looking output shapes", () => {
@@ -61,6 +77,7 @@ describe("Command Code model metadata checker", () => {
 
   it("derives image, reasoning, effort, and output-limit metadata", () => {
     assert.deepEqual(parseBundleModelCapabilities(CLI_BUNDLE, ["text-model", "vision-model"]), {
+      imageModelIds: ["vision-model"],
       reasoningModelIds: ["vision-model"],
       maxOutputTokens: { "vision-model": 32_768 },
     })
@@ -140,7 +157,7 @@ describe("Command Code model metadata checker", () => {
       `export const COMMAND_CODE_CLI_VERSION = "1.33.0"
 
 export type CommandCodeInputType = "text" | "image"
-export type CommandCodeReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+export type CommandCodeReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
 
 /**
  * Generated from command-code@1.33.0 by \`npm run sync:commandcode-catalog\`.
@@ -181,7 +198,14 @@ export const MODEL_MAX_OUTPUT_TOKENS: Readonly<Record<string, number>> = {
       () => parseModelsReference(MODELS_REFERENCE.replace("low, high", "low, turbo")),
       /Unexpected reasoning efforts/,
     )
-    assert.throws(() => parseKnownTextOnlyModelIds("const unrelated = true"), /Could not find/)
+    assert.throws(
+      () => parseEmbeddedModelCatalog("const unrelated = true", ["vision-model"]),
+      /Could not find model metadata/,
+    )
+    assert.throws(
+      () => parseBundleModelCapabilities(CLI_BUNDLE, ["missing-model"]),
+      /Could not find model metadata/,
+    )
   })
 
   it("prunes only the overrides that upstream now publishes", () => {

@@ -37,6 +37,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Compare with the latest Command Code CLI
+        shell: bash
         run: npm run check:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Publish catalog report
         if: always()
@@ -58,6 +59,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Synchronize with the latest Command Code CLI
+        shell: bash
         run: npm run sync:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Format and verify synchronized files
         run: |
@@ -87,7 +89,7 @@ jobs:
             - documented catalog snapshot version
 
             Pricing remains review-only because CLI documentation does not represent every pricing tier and temporary promotion used by the provider.
-          assignees: patlux
+          assignees: ${{ github.repository_owner }}
           add-paths: |
             src/commandcode-catalog.ts
             src/commandcode-catalog-overrides.ts
