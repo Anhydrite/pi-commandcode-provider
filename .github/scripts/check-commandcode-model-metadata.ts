@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { promisify } from "node:util"
+import ts from "typescript"
 
 import {
   COMMAND_CODE_CLI_VERSION,
@@ -16,8 +17,7 @@ import {
 const execFileAsync = promisify(execFile)
 const MODELS_REFERENCE_PATH = "dist/bundled/command-code-knowledge/reference/models.md"
 const CLI_BUNDLE_PATH = "dist/cli.mjs"
-const TEXT_ONLY_MARKER = ',__name(isKnownTextOnlyModel,"isKnownTextOnlyModel")'
-const VALID_EFFORTS = new Set(["minimal", "low", "medium", "high", "xhigh", "max"])
+const VALID_EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
 
 function quoteWindowsArgument(argument: string): string {
   if (argument.length === 0) return '""'
@@ -40,6 +40,7 @@ function execNpmFileAsync(
 }
 const CATALOG_SOURCE_PATH = new URL("../../src/commandcode-catalog.ts", import.meta.url)
 const README_PATH = new URL("../../README.md", import.meta.url)
+const OVERRIDES_SOURCE_PATH = new URL("../../src/commandcode-catalog-overrides.ts", import.meta.url)
 
 export interface CommandCodeModelMetadata {
   imageModelIds: readonly string[]
@@ -134,28 +135,15 @@ export function parseModelsReference(markdown: string): {
   }
 }
 
-export function parseKnownTextOnlyModelIds(bundle: string): readonly string[] {
-  const markerIndex = bundle.indexOf(TEXT_ONLY_MARKER)
-  if (markerIndex < 0) {
-    throw new Error("Could not find Command Code's isKnownTextOnlyModel catalog")
-  }
-
-  const setStart = bundle.lastIndexOf("new Set([", markerIndex)
-  if (setStart < 0) throw new Error("Could not find the text-only model set")
-
-  const arrayStart = setStart + "new Set(".length
-  const arrayEnd = markerIndex - 1
-  const literal = bundle.slice(arrayStart, arrayEnd)
-  const parsed: unknown = JSON.parse(literal)
-  if (!isStringArray(parsed)) throw new Error("Expected the text-only model catalog to be strings")
-
-  return sorted(new Set(parsed))
-}
-
-function modelObject(bundle: string, modelId: string): string {
-  const start = bundle.indexOf(`{id:${JSON.stringify(modelId)},inputModalities:`)
-  if (start < 0) throw new Error(`Could not find model metadata for ${modelId}`)
-
+/**
+ * Slice the object literal that starts at `start` (a `{`) and return it whole.
+ *
+ * The bundle is minified JavaScript, so the embedded catalog is not JSON: keys
+ * are unquoted and values use `!0`/`!1`. A depth counter that skips string
+ * bodies is enough to delimit one entry, and every value the catalog uses is a
+ * literal (`null`, `!0`, a number, a bare string, or a flat array literal).
+ */
+function objectLiteral(bundle: string, start: number): string {
   let depth = 0
   let quote = ""
   let escaped = false
@@ -172,38 +160,165 @@ function modelObject(bundle: string, modelId: string): string {
       continue
     }
     if (character === "{") depth += 1
-    else if (character === "}" && --depth === 0) return bundle.slice(start, index + 1)
+    else if (character === "}") {
+      depth -= 1
+      if (depth === 0) return bundle.slice(start, index + 1)
+    }
   }
 
-  throw new Error(`Unterminated model metadata for ${modelId}`)
+  throw new Error("Unterminated object literal in the Command Code CLI bundle")
+}
+
+/**
+ * Fields a model entry contributes to the generated catalog. The CLI bundle is
+ * minified, so values are literals: `null`, `!0`/`!1`, numbers, bare strings,
+ * or flat array literals.
+ */
+export interface EmbeddedModelEntry {
+  inputModalities?: readonly string[]
+  reasoning: boolean
+  reasoningEfforts?: readonly string[]
+  maxOutputTokens?: number
+}
+
+function objectLiteralAt(bundle: string, start: number): string {
+  let depth = 0
+  let quote = ""
+  let escaped = false
+  for (let index = start; index < bundle.length; index += 1) {
+    const character = bundle[index] ?? ""
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === "\\") escaped = true
+      else if (character === quote) quote = ""
+      continue
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character
+      continue
+    }
+    if (character === "{") depth += 1
+    else if (character === "}") {
+      depth -= 1
+      if (depth === 0) return bundle.slice(start, index + 1)
+    }
+  }
+
+  throw new Error("Unterminated object literal in the Command Code CLI bundle")
+}
+
+function literalField(entry: string, field: string): string | undefined {
+  const pattern = new RegExp(
+    `(?:^|[,{])${field}:("(?:[^"\\\\]|\\\\.)*"|null|!0|!1|[\\d.]+|\\[[^\\]]*\\])`,
+  )
+  return pattern.exec(entry)?.[1]
+}
+
+function stringList(value: string | undefined): readonly string[] | undefined {
+  if (value === undefined || value === "null") return undefined
+  if (!value.startsWith("[") || !value.endsWith("]")) return undefined
+  return value
+    .slice(1, -1)
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .map((item) => (item.startsWith('"') ? (JSON.parse(item) as string) : item))
+}
+
+/**
+ * Derive per-model capabilities from the CLI bundle.
+ *
+ * Older CLI releases kept a bare text-only id set next to `isKnownTextOnlyModel`
+ * and this script parsed a neighboring `new Set([...])` as JSON. Current bundles
+ * turned that marker into a function reference and embed typed model entries
+ * instead, so that parse now reads an unrelated set and dies. There is no anchor
+ * guaranteed to survive such a refactor, so match on the model ids the reference
+ * documentation already lists and read the entry that owns their capabilities.
+ *
+ * Every occurrence that owns `inputModalities` is merged, because the command
+ * catalog and the registry map disagree: the command catalog lists selectable
+ * efforts only (no `off`) and omits `reasoning` for models that reason without a
+ * selectable level, while the registry marks them `reasoning:!0`. Merging keeps
+ * a model that either source considers reasoning-capable instead of dropping the
+ * flag for everything the command catalog under-documents.
+ */
+export function parseEmbeddedModelCatalog(
+  bundle: string,
+  modelIds: readonly string[],
+): Readonly<Record<string, EmbeddedModelEntry>> {
+  const catalog: Record<string, EmbeddedModelEntry> = {}
+
+  for (const modelId of modelIds) {
+    const needle = `id:${JSON.stringify(modelId)}`
+    const entry: EmbeddedModelEntry = { reasoning: false }
+    let found = false
+
+    for (let from = 0; ; ) {
+      const at = bundle.indexOf(needle, from)
+      if (at < 0) break
+      from = at + needle.length
+
+      // The `id` also appears in an inner `display` record that owns only
+      // presentation fields, so widen until an object owns the capabilities.
+      let candidate = ""
+      for (let start = bundle.lastIndexOf("{", at); start >= 0; ) {
+        const enclosing = objectLiteralAt(bundle, start)
+        if (enclosing.includes("inputModalities:")) {
+          candidate = enclosing
+          break
+        }
+        start = bundle.lastIndexOf("{", start - 1)
+      }
+      if (!candidate) continue
+
+      const modalities = stringList(literalField(candidate, "inputModalities"))
+      if (modalities) entry.inputModalities = modalities
+      if (literalField(candidate, "reasoning") === "!0") entry.reasoning = true
+      const efforts = stringList(literalField(candidate, "reasoningEfforts"))
+      if (efforts && efforts.length > 0) {
+        entry.reasoningEfforts = efforts
+        entry.reasoning = true
+      }
+      const maxOutput = literalField(candidate, "maxOutputTokens")
+      if (maxOutput !== undefined && maxOutput !== "null") {
+        const value = Number(maxOutput)
+        if (Number.isFinite(value) && value > 0) entry.maxOutputTokens = value
+      }
+      found = true
+    }
+
+    if (!found) throw new Error(`Could not find model metadata for ${modelId}`)
+    catalog[modelId] = entry
+  }
+
+  if (Object.keys(catalog).length === 0) {
+    throw new Error("No model metadata found in the Command Code CLI bundle")
+  }
+
+  return catalog
 }
 
 export function parseBundleModelCapabilities(
   bundle: string,
   modelIds: readonly string[],
 ): {
+  imageModelIds: readonly string[]
   reasoningModelIds: readonly string[]
   maxOutputTokens: Readonly<Record<string, number>>
 } {
+  const catalog = parseEmbeddedModelCatalog(bundle, modelIds)
+  const imageModelIds: string[] = []
   const reasoningModelIds: string[] = []
   const maxOutputTokens: Record<string, number> = {}
 
-  for (const modelId of modelIds) {
-    const entry = modelObject(bundle, modelId)
-    if (entry.includes("reasoning:!0") || entry.includes("reasoningEfforts:[")) {
-      reasoningModelIds.push(modelId)
-    }
-    const maxOutput = /maxOutputTokens:([^,}]+)/.exec(entry)?.[1]
-    if (maxOutput) {
-      const value = Number(maxOutput)
-      if (!Number.isFinite(value) || value <= 0) {
-        throw new Error(`Unexpected max output tokens for ${modelId}: ${maxOutput}`)
-      }
-      maxOutputTokens[modelId] = value
-    }
+  for (const [modelId, entry] of Object.entries(catalog)) {
+    if (entry.inputModalities?.includes("image")) imageModelIds.push(modelId)
+    if (entry.reasoning) reasoningModelIds.push(modelId)
+    if (entry.maxOutputTokens !== undefined) maxOutputTokens[modelId] = entry.maxOutputTokens
   }
 
   return {
+    imageModelIds: sorted(imageModelIds),
     reasoningModelIds: sorted(reasoningModelIds),
     maxOutputTokens: Object.fromEntries(
       Object.entries(maxOutputTokens).sort(([left], [right]) => left.localeCompare(right)),
@@ -216,11 +331,10 @@ export function commandCodeModelMetadataFromContents(
   cliBundle: string,
 ): CommandCodeModelMetadata {
   const reference = parseModelsReference(modelsReference)
-  const textOnlyModelIds = new Set(parseKnownTextOnlyModelIds(cliBundle))
   const capabilities = parseBundleModelCapabilities(cliBundle, reference.modelIds)
 
   return {
-    imageModelIds: reference.modelIds.filter((modelId) => !textOnlyModelIds.has(modelId)),
+    imageModelIds: capabilities.imageModelIds,
     reasoningModelIds: capabilities.reasoningModelIds,
     reasoningEfforts: reference.reasoningEfforts,
     maxOutputTokens: capabilities.maxOutputTokens,
@@ -366,7 +480,7 @@ export function renderCommandCodeCatalog(
     )
     .join("\n")
 
-  return `export const COMMAND_CODE_CLI_VERSION = ${quoted(packageVersion)}\n\nexport type CommandCodeInputType = "text" | "image"\nexport type CommandCodeReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max"\n\n/**\n * Generated from command-code@${packageVersion} by \`npm run sync:commandcode-catalog\`.\n * Do not edit manually.\n */\nexport const MODEL_INPUT_MODALITIES: Readonly<Record<string, readonly CommandCodeInputType[]>> = {\n${imageEntries}\n}\n\nexport const MODEL_REASONING: Readonly<Record<string, true>> = {\n${reasoningEntries}\n}\n\nexport const MODEL_EFFORTS: Readonly<Record<string, readonly CommandCodeReasoningEffort[]>> = {\n${effortEntries}\n}\n\nexport const MODEL_MAX_OUTPUT_TOKENS: Readonly<Record<string, number>> = {\n${maxOutputEntries}\n}\n`
+  return `export const COMMAND_CODE_CLI_VERSION = ${quoted(packageVersion)}\n\nexport type CommandCodeInputType = "text" | "image"\nexport type CommandCodeReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"\n\n/**\n * Generated from command-code@${packageVersion} by \`npm run sync:commandcode-catalog\`.\n * Do not edit manually.\n */\nexport const MODEL_INPUT_MODALITIES: Readonly<Record<string, readonly CommandCodeInputType[]>> = {\n${imageEntries}\n}\n\nexport const MODEL_REASONING: Readonly<Record<string, true>> = {\n${reasoningEntries}\n}\n\nexport const MODEL_EFFORTS: Readonly<Record<string, readonly CommandCodeReasoningEffort[]>> = {\n${effortEntries}\n}\n\nexport const MODEL_MAX_OUTPUT_TOKENS: Readonly<Record<string, number>> = {\n${maxOutputEntries}\n}\n`
 }
 
 function updateDocumentedCatalogVersion(
@@ -379,6 +493,65 @@ function updateDocumentedCatalogVersion(
   return contents.replace(pattern, `command-code@${packageVersion}`)
 }
 
+/**
+ * Drop manual effort overrides that upstream now publishes itself.
+ *
+ * `tests/test-models.ts` fails while an override duplicates upstream efforts, so
+ * leaving the removal to a human kept the scheduled workflow red and blocked its
+ * own pull request. The overrides file is hand-formatted, so this rewrites entries
+ * and leaves comments, ordering, and still-needed entries untouched.
+ */
+export function pruneObsoleteEffortOverrides(
+  contents: string,
+  upstreamEffortModelIds: readonly string[],
+): { contents: string; removedModelIds: readonly string[] } {
+  const source = ts.createSourceFile("overrides.ts", contents, ts.ScriptTarget.Latest, true)
+  const upstreamModelIds = new Set(upstreamEffortModelIds)
+  for (const statement of source.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== "MODEL_EFFORT_OVERRIDES")
+        continue
+      const map = declaration.initializer
+      if (!map || !ts.isObjectLiteralExpression(map)) {
+        throw new Error("MODEL_EFFORT_OVERRIDES must be an object literal")
+      }
+      const obsolete = map.properties.filter(
+        (property) =>
+          ts.isPropertyAssignment(property) &&
+          ts.isStringLiteral(property.name) &&
+          upstreamModelIds.has(property.name.text),
+      )
+      const removedModelIds = obsolete.flatMap((property) =>
+        ts.isPropertyAssignment(property) && ts.isStringLiteral(property.name)
+          ? [property.name.text]
+          : [],
+      )
+      if (obsolete.length === 0) return { contents, removedModelIds }
+      if (obsolete.length === map.properties.length) {
+        return {
+          contents: contents.slice(0, map.getStart(source)) + "{}" + contents.slice(map.end),
+          removedModelIds: sorted(removedModelIds),
+        }
+      }
+      // Only remove syntax spans, preserving comments and all neighboring declarations.
+      let updated = contents
+      for (const property of [...obsolete].reverse()) {
+        const tokenStart = property.getStart(source)
+        const lineStart = contents.lastIndexOf("\n", tokenStart - 1) + 1
+        const start = /^\s*$/.test(contents.slice(lineStart, tokenStart)) ? lineStart : tokenStart
+        const comma = /^\s*,/.exec(contents.slice(property.end, map.end))
+        const tokenEnd = property.end + (comma?.[0].length ?? 0)
+        const newline = /^[ \t]*\r?\n/.exec(contents.slice(tokenEnd))
+        const end = tokenEnd + (newline?.[0].length ?? 0)
+        updated = updated.slice(0, start) + updated.slice(end)
+      }
+      return { contents: updated, removedModelIds: sorted(removedModelIds) }
+    }
+  }
+  return { contents, removedModelIds: [] }
+}
+
 export function updateReadmeCatalogVersion(readme: string, packageVersion: string): string {
   return updateDocumentedCatalogVersion(readme, packageVersion, "README")
 }
@@ -386,12 +559,19 @@ export function updateReadmeCatalogVersion(readme: string, packageVersion: strin
 async function writeSynchronizedCatalog(
   packageVersion: string,
   metadata: CommandCodeModelMetadata,
-): Promise<void> {
+): Promise<readonly string[]> {
   const readme = await readFile(README_PATH, "utf-8")
   await Promise.all([
     writeFile(CATALOG_SOURCE_PATH, renderCommandCodeCatalog(packageVersion, metadata), "utf-8"),
     writeFile(README_PATH, updateReadmeCatalogVersion(readme, packageVersion), "utf-8"),
   ])
+
+  const overrides = await readFile(OVERRIDES_SOURCE_PATH, "utf-8")
+  const pruned = pruneObsoleteEffortOverrides(overrides, Object.keys(metadata.reasoningEfforts))
+  if (pruned.removedModelIds.length > 0) {
+    await writeFile(OVERRIDES_SOURCE_PATH, pruned.contents, "utf-8")
+  }
+  return pruned.removedModelIds
 }
 
 function metadataReport(
@@ -510,8 +690,16 @@ async function main(): Promise<void> {
   console.log(report)
 
   if (write) {
-    await writeSynchronizedCatalog(upstreamPackage.packageVersion, upstreamPackage.metadata)
+    const removedOverrides = await writeSynchronizedCatalog(
+      upstreamPackage.packageVersion,
+      upstreamPackage.metadata,
+    )
     console.log(`Synchronized static metadata with command-code@${upstreamPackage.packageVersion}.`)
+    if (removedOverrides.length > 0) {
+      console.log(
+        `Removed ${removedOverrides.length} manual effort override(s) now published upstream: ${removedOverrides.join(", ")}.`,
+      )
+    }
     return
   }
 
@@ -531,7 +719,7 @@ if (isMainModule()) {
   try {
     await main()
   } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(error instanceof Error ? (error.stack ?? error.message) : String(error))
     process.exitCode = 1
   }
 }

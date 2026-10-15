@@ -6,10 +6,13 @@ on:
     paths:
       - ".github/scripts/check-commandcode-model-metadata.ts"
       - ".github/workflows/model-metadata.yml"
+      - "README.md"
+      - "src/commandcode-catalog-overrides.ts"
       - "src/commandcode-catalog.ts"
       - "src/core.ts"
       - "src/models.ts"
       - "tests/test-model-metadata-check.ts"
+      - "tests/test-models.ts"
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -34,6 +37,7 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Compare with the latest Command Code CLI
+        shell: bash
         run: npm run check:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Publish catalog report
         if: always()
@@ -55,10 +59,11 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Synchronize with the latest Command Code CLI
+        shell: bash
         run: npm run sync:commandcode-catalog | tee commandcode-catalog-report.md
       - name: Format and verify synchronized files
         run: |
-          npm run format -- src/commandcode-catalog.ts README.md
+          npm run format -- src/commandcode-catalog.ts src/commandcode-catalog-overrides.ts README.md
           npm run typecheck
           npm run test:models
           npm run format:check
@@ -84,7 +89,8 @@ jobs:
             - documented catalog snapshot version
 
             Pricing remains review-only because CLI documentation does not represent every pricing tier and temporary promotion used by the provider.
-          assignees: patlux
+          assignees: ${{ github.repository_owner }}
           add-paths: |
             src/commandcode-catalog.ts
+            src/commandcode-catalog-overrides.ts
             README.md
