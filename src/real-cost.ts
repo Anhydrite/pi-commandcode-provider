@@ -17,28 +17,36 @@
  */
 
 import { readFile, writeFile } from "node:fs/promises"
-import { homedir } from "node:os"
 import { join } from "node:path"
 
 const SETTINGS_KEY = "commandcodeRealCost"
-// pi resolves its agent dir from PI_CODING_AGENT_DIR, else ~/.pi/agent.
-const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent")
-const SETTINGS_PATH = join(AGENT_DIR, "settings.json")
 
 const TRUTHY = new Set(["1", "true", "yes", "on"])
 const FALSY = new Set(["0", "false", "no", "off"])
 
-async function readSettingsFile(): Promise<Record<string, unknown>> {
+/**
+ * Settings file that holds the toggle, inside the host's agent directory.
+ *
+ * The caller passes `getAgentDir()` from pi rather than this module reading
+ * `PI_CODING_AGENT_DIR` itself: the host already resolved that directory, it
+ * honours a configured override the provider should not second-guess, and the
+ * provider has no business reading undocumented host variables.
+ */
+function settingsPath(agentDir: string): string {
+  return join(agentDir, "settings.json")
+}
+
+async function readSettingsFile(path: string): Promise<Record<string, unknown>> {
   try {
-    const raw = await readFile(SETTINGS_PATH, "utf-8")
+    const raw = await readFile(path, "utf-8")
     return JSON.parse(raw) as Record<string, unknown>
   } catch {
     return {}
   }
 }
 
-async function writeSettingsFile(data: Record<string, unknown>): Promise<void> {
-  await writeFile(SETTINGS_PATH, JSON.stringify(data, null, 2), "utf-8")
+async function writeSettingsFile(path: string, data: Record<string, unknown>): Promise<void> {
+  await writeFile(path, JSON.stringify(data, null, 2), "utf-8")
 }
 
 /** Parse `COMMANDCODE_REAL_COST`; null when it does not express a preference. */
@@ -50,15 +58,16 @@ export function realCostFromEnv(value: string | undefined): boolean | null {
   return null
 }
 
-export async function loadRealCostEnabled(): Promise<boolean> {
-  const settings = await readSettingsFile()
+export async function loadRealCostEnabled(agentDir: string): Promise<boolean> {
+  const settings = await readSettingsFile(settingsPath(agentDir))
   const saved = settings[SETTINGS_KEY]
   if (typeof saved === "boolean") return saved
   return realCostFromEnv(process.env.COMMANDCODE_REAL_COST) ?? true
 }
 
-export async function saveRealCostEnabled(enabled: boolean): Promise<void> {
-  const settings = await readSettingsFile()
+export async function saveRealCostEnabled(agentDir: string, enabled: boolean): Promise<void> {
+  const path = settingsPath(agentDir)
+  const settings = await readSettingsFile(path)
   settings[SETTINGS_KEY] = enabled
-  await writeSettingsFile(settings)
+  await writeSettingsFile(path, settings)
 }

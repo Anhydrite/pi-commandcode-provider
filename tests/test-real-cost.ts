@@ -14,8 +14,8 @@
  *   2. `COMMANDCODE_REAL_COST` (1/true/yes/on → ON, 0/false/no/off → OFF)
  *   3. DEFAULT: ON
  *
- * `src/real-cost.ts` resolves its settings path at module load, so
- * `PI_CODING_AGENT_DIR` is pointed at a temp dir before the dynamic import.
+ * The settings path is derived per call from the agent directory the caller
+ * passes, so tests point at a temporary directory without touching the host.
  */
 
 import assert from "node:assert/strict"
@@ -24,8 +24,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { describe, it } from "node:test"
 
+// The module takes the agent directory from its caller (pi's getAgentDir())
+// instead of reading a host env var itself; the tests pass it explicitly.
 const agentDir = await mkdtemp(join(tmpdir(), "pi-cc-real-cost-"))
-process.env.PI_CODING_AGENT_DIR = agentDir
 delete process.env.COMMANDCODE_REAL_COST
 
 const { loadRealCostEnabled, saveRealCostEnabled } = await import("../src/real-cost.ts")
@@ -56,7 +57,7 @@ describe("real cost mode — default", () => {
   it("is ON when no setting is saved and no env var is set", async () => {
     await clearInputs()
     assert.equal(
-      await loadRealCostEnabled(),
+      await loadRealCostEnabled(agentDir),
       true,
       "without an explicit opt-out the real billed cost must be recorded",
     )
@@ -65,13 +66,13 @@ describe("real cost mode — default", () => {
   it("is ON when COMMANDCODE_REAL_COST is empty", async () => {
     await clearInputs()
     process.env.COMMANDCODE_REAL_COST = ""
-    assert.equal(await loadRealCostEnabled(), true)
+    assert.equal(await loadRealCostEnabled(agentDir), true)
   })
 
   it("is ON when COMMANDCODE_REAL_COST holds an unrecognized value", async () => {
     await clearInputs()
     process.env.COMMANDCODE_REAL_COST = "banana"
-    assert.equal(await loadRealCostEnabled(), true)
+    assert.equal(await loadRealCostEnabled(agentDir), true)
   })
 })
 
@@ -80,7 +81,7 @@ describe("real cost mode — COMMANDCODE_REAL_COST parsing", () => {
     it(`treats ${JSON.stringify(value)} as ON`, async () => {
       await clearInputs()
       process.env.COMMANDCODE_REAL_COST = value
-      assert.equal(await loadRealCostEnabled(), true)
+      assert.equal(await loadRealCostEnabled(agentDir), true)
     })
   }
 
@@ -88,7 +89,7 @@ describe("real cost mode — COMMANDCODE_REAL_COST parsing", () => {
     it(`treats ${JSON.stringify(value)} as OFF`, async () => {
       await clearInputs()
       process.env.COMMANDCODE_REAL_COST = value
-      assert.equal(await loadRealCostEnabled(), false)
+      assert.equal(await loadRealCostEnabled(agentDir), false)
     })
   }
 })
@@ -97,43 +98,43 @@ describe("real cost mode — saved setting wins", () => {
   it("honours a saved OFF even when the env var asks for ON", async () => {
     await resetSettings(JSON.stringify({ [SETTINGS_KEY]: false }))
     process.env.COMMANDCODE_REAL_COST = "1"
-    assert.equal(await loadRealCostEnabled(), false)
+    assert.equal(await loadRealCostEnabled(agentDir), false)
   })
 
   it("honours a saved ON even when the env var asks for OFF", async () => {
     await resetSettings(JSON.stringify({ [SETTINGS_KEY]: true }))
     process.env.COMMANDCODE_REAL_COST = "0"
-    assert.equal(await loadRealCostEnabled(), true)
+    assert.equal(await loadRealCostEnabled(agentDir), true)
   })
 
   it("ignores a non-boolean saved value and falls back to the env var", async () => {
     await resetSettings(JSON.stringify({ [SETTINGS_KEY]: "yes" }))
     process.env.COMMANDCODE_REAL_COST = "0"
-    assert.equal(await loadRealCostEnabled(), false)
+    assert.equal(await loadRealCostEnabled(agentDir), false)
   })
 })
 
 describe("real cost mode — persistence", () => {
   it("persists an opt-out under commandcodeRealCost", async () => {
     await clearInputs()
-    await saveRealCostEnabled(false)
+    await saveRealCostEnabled(agentDir, false)
     assert.equal((await readSettings())[SETTINGS_KEY], false)
-    assert.equal(await loadRealCostEnabled(), false)
+    assert.equal(await loadRealCostEnabled(agentDir), false)
   })
 
   it("persists an opt-in and keeps unrelated settings intact", async () => {
     await resetSettings(JSON.stringify({ theme: "dark", [SETTINGS_KEY]: false }))
-    await saveRealCostEnabled(true)
+    await saveRealCostEnabled(agentDir, true)
     const settings = await readSettings()
     assert.equal(settings[SETTINGS_KEY], true)
     assert.equal(settings.theme, "dark", "unrelated settings must survive the write")
-    assert.equal(await loadRealCostEnabled(), true)
+    assert.equal(await loadRealCostEnabled(agentDir), true)
   })
 
   it("keeps the opt-out sticky across a reload with the env var set to ON", async () => {
     await clearInputs()
-    await saveRealCostEnabled(false)
+    await saveRealCostEnabled(agentDir, false)
     process.env.COMMANDCODE_REAL_COST = "1"
-    assert.equal(await loadRealCostEnabled(), false)
+    assert.equal(await loadRealCostEnabled(agentDir), false)
   })
 })
